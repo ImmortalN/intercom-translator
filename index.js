@@ -5,17 +5,25 @@ const axios = require('axios');
 const app = express();
 app.use(bodyParser.json());
 
-const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
-const ENABLED = process.env.ENABLED === 'true';
-const TARGET_LANG = process.env.TARGET_LANG || 'en';
+// Переменные окружения
+const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN; // токен Intercom
+const ENABLED = process.env.ENABLED === 'true';     // включение/выключение
+const TARGET_LANG = process.env.TARGET_LANG || 'en'; // язык перевода
 
+// Webhook для Intercom
 app.post('/webhook', async (req, res) => {
-  if (!ENABLED) return res.sendStatus(200);
+  // Сразу отвечаем 200, чтобы Intercom тест прошёл
+  res.sendStatus(200);
 
+  // Если автоперевод выключен — ничего не делаем
+  if (!ENABLED) return;
+
+  // Проверяем, есть ли текст сообщения
   const messageText = req.body?.data?.item?.body;
-  if (!messageText) return res.sendStatus(200);
+  if (!messageText) return;
 
   try {
+    // Переводим сообщение через LibreTranslate
     const translateResponse = await axios.post('https://libretranslate.com/translate', {
       q: messageText,
       source: 'auto',
@@ -25,6 +33,7 @@ app.post('/webhook', async (req, res) => {
 
     const translatedText = translateResponse.data.translatedText;
 
+    // Отправляем Internal Note в Intercom
     await axios.post(
       `https://api.intercom.io/conversations/${req.body.data.item.id}/reply`,
       {
@@ -41,12 +50,12 @@ app.post('/webhook', async (req, res) => {
       }
     );
 
-    res.sendStatus(200);
+    console.log(`Message translated: ${translatedText}`);
   } catch (err) {
-    console.error(err);
-    res.sendStatus(500);
+    console.error('Error translating message:', err.message);
   }
 });
 
+// Запуск сервера
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
