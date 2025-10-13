@@ -7,20 +7,38 @@ app.use(bodyParser.json());
 
 // Переменные окружения
 const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN; // токен Intercom
-const ENABLED = process.env.ENABLED === 'true';     // включение/выключение
+const ENABLED = process.env.ENABLED === 'true';     // включение/выключение автоперевода
 const TARGET_LANG = process.env.TARGET_LANG || 'en'; // язык перевода
+
+// Тестовая страница для проверки сервера
+app.get('/', (req, res) => {
+  res.send('Server is running. Webhook endpoint: /webhook');
+});
 
 // Webhook для Intercom
 app.post('/webhook', async (req, res) => {
-  // Сразу отвечаем 200, чтобы Intercom тест прошёл
+  // Сразу отвечаем 200, чтобы Intercom считал запрос успешным
   res.sendStatus(200);
 
-  // Если автоперевод выключен — ничего не делаем
   if (!ENABLED) return;
 
-  // Проверяем, есть ли текст сообщения
-  const messageText = req.body?.data?.item?.body;
-  if (!messageText) return;
+  // Логируем полный payload для отладки
+  console.log('Webhook payload:', JSON.stringify(req.body, null, 2));
+
+  // Пытаемся извлечь текст сообщения
+  let messageText = req.body?.data?.item?.body;
+  if (!messageText) {
+    // fallback для реальных payload
+    messageText = req.body?.data?.item?.conversation_parts?.conversation_parts[0]?.body;
+  }
+
+  // Получаем правильный conversation ID
+  let conversationId = req.body?.data?.item?.id || req.body?.data?.item?.conversation?.id;
+
+  if (!messageText || !conversationId) {
+    console.log('No message text or conversation ID found. Skipping.');
+    return;
+  }
 
   try {
     // Переводим сообщение через LibreTranslate
@@ -35,7 +53,7 @@ app.post('/webhook', async (req, res) => {
 
     // Отправляем Internal Note в Intercom
     await axios.post(
-      `https://api.intercom.io/conversations/${req.body.data.item.id}/reply`,
+      `https://api.intercom.io/conversations/${conversationId}/reply`,
       {
         type: 'note',
         message_type: 'comment',
@@ -50,7 +68,7 @@ app.post('/webhook', async (req, res) => {
       }
     );
 
-    console.log(`Message translated: ${translatedText}`);
+    console.log(`Message translated for conversation ${conversationId}: ${translatedText}`);
   } catch (err) {
     console.error('Error translating message:', err.message);
   }
