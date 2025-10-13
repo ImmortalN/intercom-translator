@@ -14,24 +14,28 @@ app.get('/', (req, res) => {
 });
 
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // сразу 200 для Intercom
+  res.sendStatus(200); // сразу отвечаем Intercom
 
   if (!ENABLED) return;
 
   console.log('Webhook payload:', JSON.stringify(req.body, null, 2));
 
-  let messageText = req.body?.data?.item?.body;
+  // Попробовать несколько возможных путей для текста
+  let messageText = req.body?.data?.item?.body ||
+                    req.body?.data?.item?.conversation_parts?.[0]?.body ||
+                    req.body?.data?.item?.conversation_message?.body;
+
   if (!messageText) {
-    messageText = req.body?.data?.item?.conversation_parts?.conversation_parts[0]?.body;
+    console.log('No message text found. Skipping.');
+    return;
   }
 
   // Убираем HTML теги
-  if (messageText) messageText = messageText.replace(/<[^>]+>/g, '').trim();
+  messageText = messageText.replace(/<[^>]+>/g, '').trim();
 
   let conversationId = req.body?.data?.item?.id || req.body?.data?.item?.conversation?.id;
-
-  if (!messageText || !conversationId) {
-    console.log('No message text or conversation ID found. Skipping.');
+  if (!conversationId) {
+    console.log('No conversation ID found. Skipping.');
     return;
   }
 
@@ -45,8 +49,9 @@ app.post('/webhook', async (req, res) => {
 
     const translatedText = translateResponse.data.translatedText;
 
+    // Правильный endpoint для Internal Note
     await axios.post(
-      `https://api.intercom.io/conversations/${conversationId}/reply`,
+      `https://api.intercom.io/conversations/${conversationId}/parts`,
       {
         type: 'note',
         message_type: 'comment',
