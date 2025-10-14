@@ -2,6 +2,7 @@
   "name": "intercom-translator",
   "version": "1.0.0",
   "main": "index.js",
+  "type": "module",
   "scripts": {
     "start": "node index.js"
   },
@@ -11,5 +12,8 @@
     "dotenv": "^16.4.5",
     "express": "^4.19.2",
     "franc-min": "^6.2.0"
+  },
+  "engines": {
+    "node": "22.16.0"
   }
 }
