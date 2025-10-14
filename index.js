@@ -1,6 +1,7 @@
 import express from 'express';
 import bodyParser from 'body-parser';
 import axios from 'axios';
+import http from 'http';  // Для keep-alive
 import dotenv from 'dotenv';
 import { franc } from 'franc';
 import NodeCache from 'node-cache';
@@ -10,7 +11,7 @@ dotenv.config();
 const app = express();
 app.use(bodyParser.json());
 
-// Config (без изменений)
+// Config
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 const ENABLED = process.env.ENABLED === 'true';
@@ -23,10 +24,15 @@ const LANG_MAP = {
 };
 const INTERCOM_API_VERSION = '2.14';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
-const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
+const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
 const REQUEST_TIMEOUT = 3000;
+const DEBUG = process.env.DEBUG === 'true';
+const axiosInstance = axios.create({
+  timeout: REQUEST_TIMEOUT,
+  httpAgent: new http.Agent({ keepAlive: true })  // Keep-alive для скорости
+});
 
-// Env check (без изменений)
+// Env check
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
   console.error('Fatal: INTERCOM_TOKEN missing');
   process.exit(1);
@@ -35,7 +41,7 @@ if (!ADMIN_ID) {
   console.error('Fatal: ADMIN_ID missing');
   process.exit(1);
 }
-console.log('Server starting with ENABLED:', ENABLED, 'ADMIN_ID:', ADMIN_ID);
+console.log('Server starting with ENABLED:', ENABLED);
 
 app.get('/intercom-webhook', (req, res) => res.status(200).send('Webhook verified'));
 
@@ -53,14 +59,8 @@ app.post('/intercom-webhook', async (req, res) => {
     if (!conversationId) return;
 
     const messageText = extractMessageText(conversation);
-    console.log(`Extracted text for ${conversationId}: "${messageText}"`);  // Дебаг
-
-    if (!messageText || messageText.length < 5) {
-      console.log('Skipping: too short');
-      return;
-    }
-
-    if (conversation?.source?.author?.type === 'bot') return;
+    if (DEBUG) console.log(`Extracted for ${conversationId}: "${messageText}"`);
+    if (!messageText || messageText.length < 3) return;
 
     const translation = await translateMessage(messageText);
     if (!translation) return;
@@ -72,62 +72,47 @@ app.post('/intercom-webhook', async (req, res) => {
   }
 });
 
-// Улучшенная экстракция: последняя user часть
 function extractMessageText(conversation) {
   let parts = conversation?.conversation_parts?.conversation_parts || [];
   if (parts.length > 0) {
-    // Сортируем по created_at desc и фильтруем user + с body
     parts = parts
-      .filter(part => part?.author?.type !== 'bot' && part?.body)
+      .filter(p => p?.author?.type !== 'bot' && p?.body)
       .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
-    if (parts[0]) return cleanHtml(parts[0].body);
+    if (parts[0]) return cleanText(parts[0].body);
   }
-  // Fallback на source если нет parts
   if (conversation?.source?.body && conversation.source.author.type !== 'bot') {
-    return cleanHtml(conversation.source.body);
+    return cleanText(conversation.source.body);
   }
   return null;
 }
 
-function cleanHtml(text) {
-  return text.replace(/<[^>]+>/g, '').trim().replace(/\s+/g, ' ');  // Нормализация пробелов
+function cleanText(text) {
+  if (!text) return '';
+  return text.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').trim();
 }
 
 async function translateMessage(text) {
-  const francCode = franc(text, { minLength: 3 });
-  console.log(`Franc raw: ${francCode} for "${text.substring(0, 50)}..."`);
+  if (text.length > 1000) text = text.substring(0, 1000);  // Лимит для API
 
-  if (francCode === 'und') {
-    console.log('Skipping: undetermined language');
-    return null;
-  }
+  const francCode = franc(text, { minLength: 3 });
+  if (DEBUG) console.log(`Franc: ${francCode} for "${text.substring(0, 50)}..."`);
+
+  if (francCode === 'und') return null;
 
   const sourceLang = LANG_MAP[francCode] || 'auto';
-  if (SKIP_LANGS.includes(sourceLang)) {
-    console.log(`Skipping: ${sourceLang} in skip list`);
-    return null;
-  }
+  if (SKIP_LANGS.includes(sourceLang)) return null;
 
-  // Скип если выглядит как код/лицензия (опционально, для вашего случая)
-  if (/^[a-f0-9]{32}$/i.test(text.trim()) || text.match(/license key/i)) {
-    console.log('Skipping: looks like license key');
-    return null;
-  }
+  // Опциональный скип для ключей (удалите если не нужно)
+  // if (/license key/i.test(text) || /^[a-f0-9]{32}$/i.test(text.trim())) return null;
 
   const cacheKey = `${text}:${sourceLang}:${TARGET_LANG}`;
-  if (TRANSLATION_CACHE.has(cacheKey)) {
-    console.log('Cache hit');
-    return TRANSLATION_CACHE.get(cacheKey);
-  }
+  if (TRANSLATION_CACHE.has(cacheKey)) return TRANSLATION_CACHE.get(cacheKey);
 
   try {
     const apiSource = sourceLang === 'auto' ? 'auto' : sourceLang;
-    const response = await axios.post(
-      TRANSLATE_API_URL,
-      { q: text, source: apiSource, target: TARGET_LANG, format: 'text' },
-      { timeout: REQUEST_TIMEOUT }
-    );
-
+    const response = await axiosInstance.post(TRANSLATE_API_URL, {
+      q: text, source: apiSource, target: TARGET_LANG, format: 'text'
+    });
     const translatedText = response.data.translatedText;
     if (!translatedText) return null;
 
@@ -142,28 +127,22 @@ async function translateMessage(text) {
 }
 
 async function createInternalNote(conversationId, translation) {
-  // Без изменений
   try {
     const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
-    const notePayload = { message_type: 'note', admin_id: ADMIN_ID, body: noteBody };
-    await axios.post(
+    await axiosInstance.post(
       `https://api.intercom.io/conversations/${conversationId}/reply`,
-      notePayload,
-      {
-        headers: {
-          Authorization: INTERCOM_TOKEN,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'Intercom-Version': INTERCOM_API_VERSION
-        },
-        timeout: REQUEST_TIMEOUT
-      }
+      { message_type: 'note', admin_id: ADMIN_ID, body: noteBody },
+      { headers: {
+        Authorization: INTERCOM_TOKEN,
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+        'Intercom-Version': INTERCOM_API_VERSION
+      }}
     );
-    console.log('Note created for', conversationId);
   } catch (error) {
     console.error('Note error for', conversationId, ':', error.message);
   }
 }
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`Server on port ${PORT}`));
