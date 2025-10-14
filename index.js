@@ -20,7 +20,7 @@ const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 const TRANSLATION_CACHE = new Map();
 const REQUEST_TIMEOUT = 5000;
 const MIN_TEXT_LENGTH = 30;
-const CACHE_MAX_SIZE = 1000; // Ограничение размера кэша
+const CACHE_MAX_SIZE = 1000;
 const ENGLISH_KEYWORDS = [
   'okay', 'please', 'thanks', 'sorry', 'update', 'hello', 'hi',
   'for', 'post', 'image', 'added', 'in', 'an', 'the', 'to',
@@ -146,7 +146,6 @@ async function translateMessage(text) {
     return cachedTranslation;
   }
   
-  // Ограничение размера кэша
   if (TRANSLATION_CACHE.size >= CACHE_MAX_SIZE) {
     TRANSLATION_CACHE.clear();
     console.log('Translation cache cleared due to size limit');
