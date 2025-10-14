@@ -3,7 +3,7 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
-import { franc, all as francAll } from 'franc';  // Правильный импорт
+import { franc, all } from 'franc';  // Правильный импорт: all для confidence
 
 dotenv.config();
 
@@ -91,20 +91,21 @@ async function translateMessage(text) {
   if (text.length > 1000) text = text.substring(0, 1000);
 
   // Полный режим с confidence
-  let detections;
-  try {
-    detections = francAll(text, { minLength: 3 });
-  } catch (e) {
-    detections = [[franc(text, { minLength: 3 }), 1]];  // Fallback
-  }
+  const detections = all(text, { minLength: 3 });
   if (DEBUG) console.log('Franc detections:', detections);
-  if (detections.length === 0 || detections[0][1] < 0.6) return null;  // Выше threshold
-
-  const francCode = detections[0][0];
-  if (francCode === 'und') return null;
-
-  const sourceLang = LANG_MAP[francCode] || 'auto';
-  if (SKIP_LANGS.includes(sourceLang)) return null;
+  if (detections.length === 0 || detections[0][1] < 0.5) {
+    // Fallback на простую franc если low conf
+    const francCode = franc(text, { minLength: 3 });
+    if (DEBUG) console.log('Fallback franc:', francCode);
+    if (francCode === 'und') return null;
+    const sourceLang = LANG_MAP[francCode] || 'auto';
+    if (SKIP_LANGS.includes(sourceLang)) return null;
+  } else {
+    const francCode = detections[0][0];
+    if (francCode === 'und') return null;
+    const sourceLang = LANG_MAP[francCode] || 'auto';
+    if (SKIP_LANGS.includes(sourceLang)) return null;
+  }
 
   const cacheKey = `${text}:${sourceLang}:${TARGET_LANG}`;
   if (TRANSLATION_CACHE.has(cacheKey)) return TRANSLATION_CACHE.get(cacheKey);
