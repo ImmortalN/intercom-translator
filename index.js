@@ -162,8 +162,9 @@ async function createTranslationNote(conversationId, translation, originalText) 
     const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}\n\nOriginal: ${originalText}`;
     
     const replyPayload = {
-      admin_id: ADMIN_ID,
       type: 'note',
+      message_type: 'comment',
+      admin_id: ADMIN_ID,
       body: noteBody
     };
     
