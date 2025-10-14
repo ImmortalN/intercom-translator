@@ -11,13 +11,15 @@ app.use(bodyParser.json());
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID; // Убедитесь, что ADMIN_ID=5475435 в Render
-const ENABLED = process.env.ENABLED === 'true'; // Проверяем ENABLED
+const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.14';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
-const TRANSLATION_CACHE = new Map(); // Кэширование переводов
-const REQUEST_TIMEOUT = 5000; // Таймаут 5 секунд
+const TRANSLATION_CACHE = new Map();
+const REQUEST_TIMEOUT = 5000;
+const MIN_TEXT_LENGTH = 10; // Минимальная длина текста для перевода
+const ENGLISH_KEYWORDS = ['okay', 'please', 'thanks', 'sorry', 'update', 'hello', 'hi']; // Простой фильтр для английского
 
 // Проверка переменных окружения при старте
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
@@ -37,9 +39,8 @@ app.get('/intercom-webhook', (req, res) => {
 
 // Main webhook handler
 app.post('/intercom-webhook', async (req, res) => {
-  const start = Date.now(); // Метрика времени
+  const start = Date.now();
   try {
-    // Respond immediately to avoid webhook timeout
     res.sendStatus(200);
     
     if (!ENABLED) {
@@ -49,7 +50,6 @@ app.post('/intercom-webhook', async (req, res) => {
     
     const { topic, data } = req.body;
     
-    // Only process user messages
     if (!['conversation.user.replied', 'conversation.user.created'].includes(topic)) {
       return;
     }
@@ -62,11 +62,20 @@ app.post('/intercom-webhook', async (req, res) => {
     }
     
     const messageText = extractMessageText(conversation);
-    if (!messageText || messageText.length < 2) {
+    if (!messageText || messageText.length < MIN_TEXT_LENGTH) {
       return;
     }
     
     if (conversation?.source?.author?.type === 'bot') {
+      return;
+    }
+    
+    // Проверка на английский по ключевым словам
+    const isLikelyEnglish = ENGLISH_KEYWORDS.some(keyword => 
+      messageText.toLowerCase().includes(keyword)
+    );
+    if (isLikelyEnglish) {
+      console.log('Message likely English based on keywords, skipping translation:', messageText);
       return;
     }
     
@@ -124,7 +133,10 @@ async function translateMessage(text) {
     const { translatedText, detectedLanguage } = response.data;
     const sourceLang = detectedLanguage?.language?.toLowerCase() || 'unknown';
     
+    console.log(`Detected language: ${sourceLang}, Confidence: ${detectedLanguage?.confidence || 'unknown'}`);
+    
     if (SKIP_LANGS.includes(sourceLang)) {
+      console.log(`Skipping translation for ${sourceLang}: ${text}`);
       return null;
     }
     
@@ -169,6 +181,10 @@ async function createInternalNote(conversationId, translation) {
     console.error('Note creation error for conversation', conversationId, ':', error.response?.status, error.response?.data || error.message);
   }
 }
+
+// Очистка кэша для проблемного сообщения
+TRANSLATION_CACHE.delete('okay, please keep update me:en');
+console.log('Cleared cache for "okay, please keep update me"');
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
