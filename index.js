@@ -3,7 +3,7 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
-import franc from 'franc';  // Изменил импорт на default для all
+import { franc, all as francAll } from 'franc';  // Правильный импорт
 
 dotenv.config();
 
@@ -70,8 +70,8 @@ function extractMessageText(conversation) {
   if (parts.length > 0) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
-      .filter(p => p?.author?.type === 'user' && p?.body)  // Строго user, не admin/bot
-      .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));  // updated_at приоритет
+      .filter(p => p?.author?.type === 'user' && p?.body)  // Строго user
+      .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
     if (parts[0]) return cleanText(parts[0].body);
   }
   if (conversation?.source?.author?.type === 'user' && conversation.source.body) {
@@ -82,18 +82,23 @@ function extractMessageText(conversation) {
 
 function cleanText(text) {
   if (!text) return '';
-  // Удаляем license-like и мусор
   text = text.replace(/license key[:\s]*[a-f0-9]{32}/gi, '').trim();
-  return text.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').replace(/https?:\S+/g, '').trim();
+  text = text.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').replace(/https?:\S+/g, '').trim();
+  return text;
 }
 
 async function translateMessage(text) {
   if (text.length > 1000) text = text.substring(0, 1000);
 
-  // Полный franc с confidence
-  const detections = franc.all(text, { minLength: 3 });
+  // Полный режим с confidence
+  let detections;
+  try {
+    detections = francAll(text, { minLength: 3 });
+  } catch (e) {
+    detections = [[franc(text, { minLength: 3 }), 1]];  // Fallback
+  }
   if (DEBUG) console.log('Franc detections:', detections);
-  if (detections.length === 0 || detections[0][1] < 0.5) return null;  // Низкая уверенность
+  if (detections.length === 0 || detections[0][1] < 0.6) return null;  // Выше threshold
 
   const francCode = detections[0][0];
   if (francCode === 'und') return null;
@@ -110,10 +115,10 @@ async function translateMessage(text) {
       q: text, source: apiSource, target: TARGET_LANG, format: 'text'
     });
     let translatedText = response.data.translatedText;
-    if (!translatedText || translatedText.trim() === text.trim()) return null;  // Нет изменений = source==target
+    if (!translatedText || translatedText.trim() === text.trim()) return null;
 
     const finalSource = apiSource === 'auto' ? (response.data.detectedLanguage?.language || sourceLang) : sourceLang;
-    if (finalSource === TARGET_LANG) return null;  // Ещё один guard
+    if (finalSource === TARGET_LANG) return null;
 
     const translation = { text: translatedText, sourceLang: finalSource, targetLang: TARGET_LANG };
     TRANSLATION_CACHE.set(cacheKey, translation);
