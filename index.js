@@ -3,11 +3,15 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { franc } from 'franc-min';
+import pino from 'pino';
 
 dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
+
+// Logger
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
 
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
@@ -32,19 +36,19 @@ const ENGLISH_KEYWORDS = [
 
 // Проверка переменных окружения
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
-  console.error('Fatal: INTERCOM_TOKEN is missing or invalid');
+  logger.error('Fatal: INTERCOM_TOKEN is missing or invalid');
   process.exit(1);
 }
 if (!ADMIN_ID) {
-  console.error('Fatal: ADMIN_ID is missing');
+  logger.error('Fatal: ADMIN_ID is missing');
   process.exit(1);
 }
-console.info('Server starting with ENABLED:', ENABLED, 'ADMIN_ID:', ADMIN_ID);
+logger.info({ ENABLED, ADMIN_ID }, 'Server starting');
 
 // Очистка кэша при старте
 TRANSLATION_CACHE.clear();
 HTML_CACHE.clear();
-console.info('Caches cleared at startup');
+logger.info('Caches cleared at startup');
 
 // Webhook verification endpoint
 app.get('/intercom-webhook', (req, res) => {
@@ -58,7 +62,7 @@ app.post('/intercom-webhook', async (req, res) => {
     res.sendStatus(200);
     
     if (!ENABLED) {
-      console.info('Webhook processing disabled (ENABLED=false)');
+      logger.info('Webhook processing disabled (ENABLED=false)');
       return;
     }
     
@@ -77,7 +81,7 @@ app.post('/intercom-webhook', async (req, res) => {
     
     const messageText = extractMessageText(conversation);
     if (!messageText || messageText.length < MIN_TEXT_LENGTH) {
-      console.info(`Skipping short message: ${messageText}`);
+      logger.info({ messageText }, 'Skipping short message');
       return;
     }
     
@@ -90,14 +94,14 @@ app.post('/intercom-webhook', async (req, res) => {
       messageText.toLowerCase().includes(keyword)
     );
     if (isLikelyEnglish) {
-      console.info('Message likely English based on keywords, skipping:', messageText);
+      logger.info({ messageText }, 'Message likely English based on keywords, skipping');
       return;
     }
     
     // Локальная проверка языка через franc
     const francLang = franc(messageText, { minLength: 3 });
     if (francLang === 'eng') {
-      console.info('Franc detected English, skipping:', messageText);
+      logger.info({ messageText }, 'Franc detected English, skipping');
       return;
     }
     
@@ -108,10 +112,10 @@ app.post('/intercom-webhook', async (req, res) => {
     
     await createInternalNote(conversationId, translation);
     
-    console.info(`Webhook processed for conversation ${conversationId} in ${Date.now() - start}ms`);
+    logger.info({ conversationId, duration: Date.now() - start }, 'Webhook processed');
     
   } catch (error) {
-    console.error('Webhook error:', error.response?.status || error.message);
+    logger.error({ error: error.response?.status || error.message }, 'Webhook error');
   }
 });
 
@@ -141,7 +145,7 @@ function cleanHtml(text) {
   HTML_CACHE.set(text, cleaned);
   if (HTML_CACHE.size >= CACHE_MAX_SIZE) {
     HTML_CACHE.clear();
-    console.info('HTML cache cleared due to size limit');
+    logger.info('HTML cache cleared due to size limit');
   }
   return cleaned;
 }
@@ -152,16 +156,16 @@ async function translateMessage(text) {
   if (TRANSLATION_CACHE.has(cacheKey)) {
     const cachedTranslation = TRANSLATION_CACHE.get(cacheKey);
     if (SKIP_LANGS.includes(cachedTranslation.sourceLang)) {
-      console.info(`Skipping cached translation for ${cachedTranslation.sourceLang}: ${text}`);
+      logger.info({ sourceLang: cachedTranslation.sourceLang, text }, 'Skipping cached translation');
       return null;
     }
-    console.info('Using cached translation for:', text, 'Language:', cachedTranslation.sourceLang);
+    logger.info({ text, sourceLang: cachedTranslation.sourceLang }, 'Using cached translation');
     return cachedTranslation;
   }
   
   if (TRANSLATION_CACHE.size >= CACHE_MAX_SIZE) {
     TRANSLATION_CACHE.clear();
-    console.info('Translation cache cleared due to size limit');
+    logger.info('Translation cache cleared due to size limit');
   }
   
   try {
@@ -174,10 +178,10 @@ async function translateMessage(text) {
     const { translatedText, detectedLanguage } = response.data;
     const sourceLang = detectedLanguage?.language?.toLowerCase() || 'unknown';
     
-    console.info(`Detected language: ${sourceLang}, Confidence: ${detectedLanguage?.confidence || 'unknown'}`);
+    logger.info({ sourceLang, confidence: detectedLanguage?.confidence || 'unknown' }, 'Detected language');
     
     if (SKIP_LANGS.includes(sourceLang)) {
-      console.info(`Skipping translation for ${sourceLang}: ${text}`);
+      logger.info({ sourceLang, text }, 'Skipping translation');
       return null;
     }
     
@@ -199,7 +203,7 @@ async function translateMessage(text) {
     return translation;
     
   } catch (error) {
-    console.error('Translation error:', error.response?.status || error.message);
+    logger.error({ error: error.response?.status || error.message }, 'Translation error');
     return null;
   }
 }
@@ -229,14 +233,14 @@ async function createInternalNote(conversationId, translation) {
       }
     );
     
-    console.info(`Note created for conversation ${conversationId}, Status: ${response.status}`);
+    logger.info({ conversationId, status: response.status }, 'Note created');
     
   } catch (error) {
-    console.error('Note creation error for conversation', conversationId, ':', error.response?.status, error.response?.data || error.message);
+    logger.error({ conversationId, error: error.response?.status, details: error.response?.data || error.message }, 'Note creation error');
   }
 }
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.info(`Translation webhook server running on port ${PORT}`);
+  logger.info(`Translation webhook server running on port ${PORT}`);
 });
