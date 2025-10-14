@@ -11,13 +11,13 @@ app.use(bodyParser.json());
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID; // Убедитесь, что ADMIN_ID=5475435 в Render
+const ENABLED = process.env.ENABLED === 'true'; // Проверяем ENABLED
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.14';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
-const TEST_CONVERSATION_ID = '215471280601196';
-const TRANSLATION_CACHE = new Map(); // Простое кэширование переводов
-const REQUEST_TIMEOUT = 5000; // Таймаут 5 секунд для сетевых запросов
+const TRANSLATION_CACHE = new Map(); // Кэширование переводов
+const REQUEST_TIMEOUT = 5000; // Таймаут 5 секунд
 
 // Проверка переменных окружения при старте
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
@@ -28,19 +28,24 @@ if (!ADMIN_ID) {
   console.error('Fatal: ADMIN_ID is missing');
   process.exit(1);
 }
-console.log('Server starting with ADMIN_ID:', ADMIN_ID);
+console.log('Server starting with ENABLED:', ENABLED, 'ADMIN_ID:', ADMIN_ID);
 
 // Webhook verification endpoint
 app.get('/intercom-webhook', (req, res) => {
-  console.log('Webhook verification received');
   res.status(200).send('Webhook verified');
 });
 
 // Main webhook handler
 app.post('/intercom-webhook', async (req, res) => {
+  const start = Date.now(); // Метрика времени
   try {
     // Respond immediately to avoid webhook timeout
     res.sendStatus(200);
+    
+    if (!ENABLED) {
+      console.log('Webhook processing disabled (ENABLED=false)');
+      return;
+    }
     
     const { topic, data } = req.body;
     
@@ -52,8 +57,7 @@ app.post('/intercom-webhook', async (req, res) => {
     const conversation = data?.item;
     const conversationId = conversation?.id;
     
-    // Process only the test conversation
-    if (conversationId !== TEST_CONVERSATION_ID) {
+    if (!conversationId) {
       return;
     }
     
@@ -73,6 +77,8 @@ app.post('/intercom-webhook', async (req, res) => {
     
     await createInternalNote(conversationId, translation);
     
+    console.log(`Webhook processed for conversation ${conversationId} in ${Date.now() - start}ms`);
+    
   } catch (error) {
     console.error('Webhook error:', error.response?.status || error.message);
   }
@@ -80,10 +86,9 @@ app.post('/intercom-webhook', async (req, res) => {
 
 // Extract message text efficiently
 function extractMessageText(conversation) {
-  const parts = conversation?.conversation_parts?.conversation_parts || [];
   const sources = [
-    parts[parts.length - 1]?.body, // Last part
-    parts[0]?.body, // First part
+    conversation?.conversation_parts?.conversation_parts?.slice(-1)[0]?.body,
+    conversation?.conversation_parts?.conversation_parts?.[0]?.body,
     conversation?.source?.body,
     conversation?.body
   ];
@@ -105,7 +110,7 @@ function cleanHtml(text) {
 async function translateMessage(text) {
   const cacheKey = `${text}:${TARGET_LANG}`;
   if (TRANSLATION_CACHE.has(cacheKey)) {
-    console.log('Using cached translation for:', text);
+    console.log('Using cached translation');
     return TRANSLATION_CACHE.get(cacheKey);
   }
   
@@ -124,7 +129,7 @@ async function translateMessage(text) {
     }
     
     const translation = { text: translatedText, sourceLang, targetLang: TARGET_LANG };
-    TRANSLATION_CACHE.set(cacheKey, translation); // Cache result
+    TRANSLATION_CACHE.set(cacheKey, translation);
     return translation;
     
   } catch (error) {
@@ -161,7 +166,7 @@ async function createInternalNote(conversationId, translation) {
     console.log('Note created for conversation', conversationId, 'Status:', response.status);
     
   } catch (error) {
-    console.error('Note creation error:', error.response?.status, error.response?.data || error.message);
+    console.error('Note creation error for conversation', conversationId, ':', error.response?.status, error.response?.data || error.message);
   }
 }
 
