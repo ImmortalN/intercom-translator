@@ -1,15 +1,16 @@
 {
   "name": "intercom-translator",
   "version": "1.0.0",
+  "description": "Автопереводчик сообщений для Intercom",
   "main": "index.js",
+  "type": "module",  // Добавьте эту строку
   "scripts": {
     "start": "node index.js"
   },
   "dependencies": {
-    "axios": "^1.7.2",
-    "body-parser": "^1.20.2",
-    "dotenv": "^16.4.5",
     "express": "^4.19.2",
-    "franc-min": "^6.2.0"
+    "body-parser": "^1.20.3",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5"
   }
 }
