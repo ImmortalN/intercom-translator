@@ -12,7 +12,7 @@ const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
-const INTERCOM_API_VERSION = '2.14'; // Смените, если в Intercom Webhook другая версия
+const INTERCOM_API_VERSION = '2.9'; // Смените, если в Intercom Webhook другая версия
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate'; // LibreTranslate сервер
 
 app.get('/intercom-webhook', (req, res) => {
@@ -24,8 +24,8 @@ app.post('/intercom-webhook', async (req, res) => {
   try {
     console.log('Webhook POST received. Full payload:', JSON.stringify(req.body, null, 2));
 
-    if (!INTERCOM_TOKEN || !ADMIN_ID) {
-      console.error('Missing env vars: INTERCOM_TOKEN or ADMIN_ID');
+    if (!INTERCOM_TOKEN) {
+      console.error('Missing env var: INTERCOM_TOKEN');
       return res.sendStatus(500);
     }
 
@@ -82,9 +82,7 @@ app.post('/intercom-webhook', async (req, res) => {
     /*
     const noteBody = 'Test note from webhook';
     const replyPayload = {
-      admin_id: ADMIN_ID,
       type: 'note',
-      message_type: 'comment',
       body: noteBody
     };
     console.log('Sending test note to Intercom:', replyPayload);
@@ -135,9 +133,7 @@ app.post('/intercom-webhook', async (req, res) => {
     // Реальный note
     const noteBody = `📝 Auto-translation (${sourceLang} → ${TARGET_LANG}): ${translatedText}\n\nOriginal: ${messageText}`;
     const replyPayload = {
-      admin_id: ADMIN_ID,
       type: 'note',
-      message_type: 'comment',
       body: noteBody
     };
     console.log('Sending note to Intercom:', replyPayload);
