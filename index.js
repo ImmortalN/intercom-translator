@@ -10,7 +10,6 @@ app.use(bodyParser.json());
 
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
-const ADMIN_ID = process.env.ADMIN_ID; // Required for conversation notes
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
@@ -28,8 +27,8 @@ app.post('/intercom-webhook', async (req, res) => {
     
     console.log('Webhook received:', JSON.stringify(req.body, null, 2));
     
-    if (!INTERCOM_TOKEN || !ADMIN_ID) {
-      console.error('Missing INTERCOM_TOKEN or ADMIN_ID');
+    if (!INTERCOM_TOKEN) {
+      console.error('Missing INTERCOM_TOKEN');
       return;
     }
     
@@ -71,7 +70,7 @@ app.post('/intercom-webhook', async (req, res) => {
       return;
     }
     
-    await createConversationNote(conversationId, translation, messageText);
+    await createInternalNote(conversationId, translation, messageText);
     
   } catch (error) {
     console.error('Webhook error:', error.message);
@@ -137,32 +136,31 @@ async function translateMessage(text) {
   }
 }
 
-async function createConversationNote(conversationId, translation, originalText) {
+async function createInternalNote(conversationId, translation, originalText) {
   try {
     const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}\n\nOriginal: ${originalText}`;
     
-    const replyPayload = {
+    // Create internal note using conversation parts endpoint
+    const notePayload = {
       type: 'note',
-      body: noteBody,
-      admin_id: ADMIN_ID
+      body: noteBody
     };
     
-    console.log('Creating conversation note:', replyPayload);
+    console.log('Creating internal note:', notePayload);
     
     const response = await axios.post(
       `https://api.intercom.io/conversations/${conversationId}/reply`,
-      replyPayload,
+      notePayload,
       {
         headers: {
           'Authorization': INTERCOM_TOKEN,
           'Content-Type': 'application/json',
-          'Accept': 'application/json',
-          'Intercom-Version': '2.9'
+          'Accept': 'application/json'
         }
       }
     );
     
-    console.log('Conversation note created successfully:', response.status);
+    console.log('Internal note created successfully:', response.status);
     
   } catch (error) {
     console.error('Note creation error:', error.response?.status, error.response?.data || error.message);
