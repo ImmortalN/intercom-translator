@@ -13,9 +13,15 @@ const ADMIN_ID = process.env.ADMIN_ID;
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 
+// Тестовый GET для Intercom webhook verification
+app.get('/intercom-webhook', (req, res) => {
+  console.log('Received GET test webhook:', JSON.stringify(req.query, null, 2));
+  res.status(200).send('Webhook test successful');
+});
+
 app.post('/intercom-webhook', async (req, res) => {
   try {
-    console.log('Webhook received. Full payload:', JSON.stringify(req.body, null, 2)); // Полный дебаг payload
+    console.log('Webhook POST received. Full payload:', JSON.stringify(req.body, null, 2));
 
     if (!INTERCOM_TOKEN || !ADMIN_ID) {
       console.error('Missing env vars: INTERCOM_TOKEN or ADMIN_ID');
@@ -34,11 +40,9 @@ app.post('/intercom-webhook', async (req, res) => {
     console.log(`Conversation ID: ${conversationId}`);
     if (!conversationId) return res.sendStatus(200);
 
-    // Дебаг структуры частей (как советует support)
     console.log('Conversation parts structure:', JSON.stringify(conversation?.conversation_parts, null, 2));
     console.log('Conversation body:', conversation?.body);
 
-    // Извлечение текста: приоритет - последняя user part, fallback на body
     let messageText = '';
     const parts = conversation?.conversation_parts?.conversation_parts || [];
     const lastPart = parts.slice(-1)[0];
@@ -74,11 +78,11 @@ app.post('/intercom-webhook', async (req, res) => {
     }
     console.log(`Translated: ${translatedText}`);
 
-    // Добавляем note через /reply (как советует support)
+    // Добавляем note через /reply
     const noteBody = `📝 Auto-translation (${sourceLang} → ${TARGET_LANG}): ${translatedText}\n\nOriginal: ${messageText}`;
     const replyPayload = {
       admin_id: ADMIN_ID,
-      type: 'note',  // Для internal note
+      type: 'note',
       message_type: 'comment',
       body: noteBody
     };
@@ -91,11 +95,10 @@ app.post('/intercom-webhook', async (req, res) => {
           Authorization: INTERCOM_TOKEN,
           'Content-Type': 'application/json',
           Accept: 'application/json'
-          // Убрано Intercom-Version - пусть дефолт
         }
       }
     );
-    console.log('Intercom response:', reply充Res.data);  // Дебаг ответа
+    console.log('Intercom response:', replyRes.data);
 
     res.sendStatus(200);
   } catch (err) {
@@ -104,5 +107,5 @@ app.post('/intercom-webhook', async (req, res) => {
   }
 });
 
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
