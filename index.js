@@ -12,6 +12,7 @@ const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
+const INTERCOM_API_VERSION = '2.9'; // Смените на вашу версию из Intercom Webhook settings (или 'Unversioned')
 
 app.get('/intercom-webhook', (req, res) => {
   console.log('Received GET test webhook:', JSON.stringify(req.query, null, 2));
@@ -45,8 +46,9 @@ app.post('/intercom-webhook', async (req, res) => {
     // Дебаг структуры
     console.log('Conversation parts structure:', JSON.stringify(conversation?.conversation_parts, null, 2));
     console.log('Conversation body:', conversation?.body);
+    console.log('Source body:', conversation?.source?.body);
 
-    // Извлечение текста: проверяем все возможные места
+    // Извлечение текста
     let messageText = '';
     const parts = conversation?.conversation_parts?.conversation_parts || [];
     const lastPart = parts.slice(-1)[0];
@@ -55,45 +57,14 @@ app.post('/intercom-webhook', async (req, res) => {
       messageText = lastPart.body.replace(/<[^>]+>/g, '').trim();
     } else if (firstPart && firstPart.author?.type === 'user' && firstPart.body) {
       messageText = firstPart.body.replace(/<[^>]+>/g, '').trim();
+    } else if (conversation?.source?.body) {
+      messageText = conversation.source.body.replace(/<[^>]+>/g, '').trim();
     } else if (conversation?.body) {
       messageText = conversation.body.replace(/<[^>]+>/g, '').trim();
     }
     console.log(`Extracted message text: ${messageText}`);
     if (!messageText || messageText.length < 2) {
       console.log('Empty or too short message - skipping');
-      return res.sendStatus(200);
-    }
-
-    // Детект языка
-    let sourceLang = '';
-    try {
-      const detectParams = { client: 'gtx', dt: 'ld', q: messageText };
-      const detectRes = await axios.post('https://translate.googleapis.com/translate_a/single', null, { params: detectParams });
-      sourceLang = detectRes.data?.[2]?.toLowerCase();
-      console.log(`Detected language: ${sourceLang}`, detectRes.data);
-    } catch (err) {
-      console.error('Language detection failed:', err.message);
-      return res.sendStatus(200);
-    }
-
-    if (!sourceLang || SKIP_LANGS.includes(sourceLang)) {
-      console.log(`Skipping translation for lang ${sourceLang}`);
-      return res.sendStatus(200);
-    }
-
-    // Перевод
-    let translatedText = '';
-    try {
-      const translateParams = { client: 'gtx', sl: sourceLang, tl: TARGET_LANG, dt: 't', q: messageText };
-      const translateRes = await axios.post('https://translate.googleapis.com/translate_a/single', null, { params: translateParams });
-      translatedText = translateRes.data?.[0]?.[0]?.[0];
-      console.log(`Translated: ${translatedText}`);
-    } catch (err) {
-      console.error('Translation failed:', err.message);
-      return res.sendStatus(200);
-    }
-    if (!translatedText) {
-      console.log('Translation returned empty');
       return res.sendStatus(200);
     }
 
@@ -115,15 +86,42 @@ app.post('/intercom-webhook', async (req, res) => {
           Authorization: INTERCOM_TOKEN,
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          'Intercom-Version': '2.9' // Добавлено по совету Intercom
+          'Intercom-Version': INTERCOM_API_VERSION
         }
       }
     );
-    console.log('Intercom test note response:', replyRes.data);
+    console.log('Intercom test note response:', replyRes.status, replyRes.data);
     return res.sendStatus(200);
     */
 
-    // Реальный note с переводом
+    // Детекция и перевод через LibreTranslate
+    let sourceLang = '';
+    let translatedText = '';
+    try {
+      const translateRes = await axios.post('https://libretranslate.de/translate', {
+        q: messageText,
+        source: 'auto',
+        target: TARGET_LANG,
+        format: 'text'
+      });
+      sourceLang = translateRes.data.detectedLanguage?.language?.toLowerCase() || 'auto';
+      translatedText = translateRes.data.translatedText;
+      console.log(`Detected language: ${sourceLang}, Translated: ${translatedText}`);
+    } catch (err) {
+      console.error('Translation failed:', err.response?.status, err.response?.data || err.message);
+      return res.sendStatus(200);
+    }
+    if (!translatedText) {
+      console.log('Translation returned empty');
+      return res.sendStatus(200);
+    }
+
+    if (!sourceLang || SKIP_LANGS.includes(sourceLang)) {
+      console.log(`Skipping translation for lang ${sourceLang}`);
+      return res.sendStatus(200);
+    }
+
+    // Реальный note
     const noteBody = `📝 Auto-translation (${sourceLang} → ${TARGET_LANG}): ${translatedText}\n\nOriginal: ${messageText}`;
     const replyPayload = {
       admin_id: ADMIN_ID,
@@ -140,15 +138,15 @@ app.post('/intercom-webhook', async (req, res) => {
           Authorization: INTERCOM_TOKEN,
           'Content-Type': 'application/json',
           Accept: 'application/json',
-          'Intercom-Version': '2.9' // Попробуйте 2.9 или Unversioned
+          'Intercom-Version': INTERCOM_API_VERSION
         }
       }
     );
-    console.log('Intercom response:', replyRes.data);
+    console.log('Intercom response:', replyRes.status, replyRes.data);
 
     res.sendStatus(200);
   } catch (err) {
-    console.error('Error details:', err.response?.data || err.message, err.stack);
+    console.error('Error details:', err.response?.status, err.response?.data || err.message, err.stack);
     res.sendStatus(500);
   }
 });
