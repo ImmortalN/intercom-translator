@@ -9,7 +9,6 @@ const app = express();
 app.use(bodyParser.json());
 
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
-const ADMIN_ID = process.env.ADMIN_ID;
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.9'; // Смените, если в Intercom Webhook другая версия
@@ -41,6 +40,14 @@ app.post('/intercom-webhook', async (req, res) => {
     console.log(`Conversation ID: ${conversationId}`);
     if (!conversationId) {
       console.log('No conversation ID - skipping');
+      return res.sendStatus(200);
+    }
+
+    // Извлечение contact_id
+    const contactId = conversation?.contacts?.contacts?.[0]?.id || conversation?.source?.author?.id;
+    console.log(`Contact ID: ${contactId}`);
+    if (!contactId) {
+      console.log('No contact ID - skipping');
       return res.sendStatus(200);
     }
 
@@ -82,12 +89,12 @@ app.post('/intercom-webhook', async (req, res) => {
     /*
     const noteBody = 'Test note from webhook';
     const replyPayload = {
-      type: 'note',
+      contact: { id: contactId },
       body: noteBody
     };
     console.log('Sending test note to Intercom:', replyPayload);
     const replyRes = await axios.post(
-      `https://api.intercom.io/conversations/${conversationId}/reply`,
+      'https://api.intercom.io/notes',
       replyPayload,
       {
         headers: {
@@ -133,12 +140,12 @@ app.post('/intercom-webhook', async (req, res) => {
     // Реальный note
     const noteBody = `📝 Auto-translation (${sourceLang} → ${TARGET_LANG}): ${translatedText}\n\nOriginal: ${messageText}`;
     const replyPayload = {
-      type: 'note',
+      contact: { id: contactId },
       body: noteBody
     };
     console.log('Sending note to Intercom:', replyPayload);
     const replyRes = await axios.post(
-      `https://api.intercom.io/conversations/${conversationId}/reply`,
+      'https://api.intercom.io/notes',
       replyPayload,
       {
         headers: {
