@@ -10,6 +10,7 @@ app.use(bodyParser.json());
 
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
+const ADMIN_ID = process.env.ADMIN_ID; // Добавьте в Render Environment Variables
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.9'; // Смените, если в Intercom Webhook другая версия
@@ -33,6 +34,11 @@ app.post('/intercom-webhook', async (req, res) => {
       console.error('Missing INTERCOM_TOKEN');
       return;
     }
+    if (!ADMIN_ID) {
+      console.error('Missing ADMIN_ID');
+      return;
+    }
+    console.log(`Using ADMIN_ID: ${ADMIN_ID}`);
 
     const { topic, data } = req.body;
     
@@ -156,6 +162,7 @@ async function createTranslationNote(conversationId, translation, originalText) 
     const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}\n\nOriginal: ${originalText}`;
     
     const replyPayload = {
+      admin_id: ADMIN_ID,
       type: 'note',
       body: noteBody
     };
