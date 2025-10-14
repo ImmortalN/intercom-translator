@@ -3,8 +3,7 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
-import { franc } from 'franc';  // Базовая
-import all from 'franc-all';  // Final fix: default export для confidence
+import { franc } from 'franc';  // Только базовая, без confidence
 import NodeCache from 'node-cache';
 
 dotenv.config();
@@ -92,26 +91,11 @@ function cleanText(text) {
 async function translateMessage(text) {
   if (text.length > 1000) text = text.substring(0, 1000);
 
-  let sourceLang;
-  let detections = [];
-  try {
-    detections = all(text, { minLength: 3 });  // Confidence from franc-all default
-  } catch (e) {
-    console.error('Franc-all error, fallback to basic');
-  }
-  if (DEBUG) console.log('Franc detections:', detections);
+  const francCode = franc(text, { minLength: 3 });
+  if (DEBUG) console.log('Franc code:', francCode);
+  if (francCode === 'und') return null;
 
-  if (detections.length > 0 && detections[0][1] >= 0.5) {
-    const francCode = detections[0][0];
-    if (francCode === 'und') return null;
-    sourceLang = LANG_MAP[francCode] || 'auto';
-  } else {
-    const francCode = franc(text, { minLength: 3 });
-    if (DEBUG) console.log('Fallback franc:', francCode);
-    if (francCode === 'und') return null;
-    sourceLang = LANG_MAP[francCode] || 'auto';
-  }
-
+  const sourceLang = LANG_MAP[francCode] || 'auto';
   if (SKIP_LANGS.includes(sourceLang)) return null;
 
   const cacheKey = `${text}:${sourceLang}:${TARGET_LANG}`;
