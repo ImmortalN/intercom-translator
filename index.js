@@ -4,7 +4,7 @@ import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
 import { franc } from 'franc';  // Базовая
-import { all } from 'franc-all';  // Фикс: named export для confidence
+import all from 'franc-all';  // Final fix: default export для confidence
 import NodeCache from 'node-cache';
 
 dotenv.config();
@@ -95,7 +95,7 @@ async function translateMessage(text) {
   let sourceLang;
   let detections = [];
   try {
-    detections = all(text, { minLength: 3 });  // Confidence from franc-all
+    detections = all(text, { minLength: 3 });  // Confidence from franc-all default
   } catch (e) {
     console.error('Franc-all error, fallback to basic');
   }
