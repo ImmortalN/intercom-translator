@@ -10,36 +10,23 @@ dotenv.config();
 const app = express();
 app.use(bodyParser.json());
 
-// Configuration
+// Config (без изменений)
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
-// Расширенный маппинг franc (ISO 639-3) на ISO 639-1. Добавьте любые языки для детекции.
 const LANG_MAP = {
-  'eng': 'en',
-  'rus': 'ru',
-  'ukr': 'uk',
-  'spa': 'es',  // Spanish
-  'deu': 'de',  // German
-  'fra': 'fr',  // French
-  'ita': 'it',  // Italian
-  'por': 'pt',  // Portuguese
-  'pol': 'pl',  // Polish
-  'ces': 'cs',  // Czech
-  'nld': 'nl',  // Dutch
-  'tur': 'tr',  // Turkish
-  'ara': 'ar',  // Arabic
-  'cmn': 'zh',  // Chinese (Mandarin)
-  // Добавьте больше по необходимости (список кодов franc: https://github.com/wooorm/franc/blob/main/packages/franc-min/index.json)
+  'eng': 'en', 'rus': 'ru', 'ukr': 'uk', 'spa': 'es', 'deu': 'de', 'fra': 'fr',
+  'ita': 'it', 'por': 'pt', 'pol': 'pl', 'ces': 'cs', 'nld': 'nl', 'tur': 'tr',
+  'ara': 'ar', 'cmn': 'zh'
 };
 const INTERCOM_API_VERSION = '2.14';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
 const REQUEST_TIMEOUT = 3000;
 
-// Проверка env
+// Env check (без изменений)
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
   console.error('Fatal: INTERCOM_TOKEN missing');
   process.exit(1);
@@ -50,19 +37,13 @@ if (!ADMIN_ID) {
 }
 console.log('Server starting with ENABLED:', ENABLED, 'ADMIN_ID:', ADMIN_ID);
 
-// Webhook verify
 app.get('/intercom-webhook', (req, res) => res.status(200).send('Webhook verified'));
 
-// Main handler
 app.post('/intercom-webhook', async (req, res) => {
   const start = Date.now();
   try {
     res.sendStatus(200);
-
-    if (!ENABLED) {
-      console.log('Webhook disabled');
-      return;
-    }
+    if (!ENABLED) return;
 
     const { topic, data } = req.body;
     if (!['conversation.user.replied', 'conversation.user.created'].includes(topic)) return;
@@ -72,8 +53,10 @@ app.post('/intercom-webhook', async (req, res) => {
     if (!conversationId) return;
 
     const messageText = extractMessageText(conversation);
-    if (!messageText || messageText.length < 5) {  // Уменьшил для теста, потом верните 10
-      console.log('Skipping: message too short or empty');
+    console.log(`Extracted text for ${conversationId}: "${messageText}"`);  // Дебаг
+
+    if (!messageText || messageText.length < 5) {
+      console.log('Skipping: too short');
       return;
     }
 
@@ -83,68 +66,72 @@ app.post('/intercom-webhook', async (req, res) => {
     if (!translation) return;
 
     await createInternalNote(conversationId, translation);
-
     console.log(`Processed ${conversationId} in ${Date.now() - start}ms`);
   } catch (error) {
     console.error('Webhook error:', error.message);
   }
 });
 
-// Extract text
+// Улучшенная экстракция: последняя user часть
 function extractMessageText(conversation) {
-  const sources = [
-    conversation?.source?.body,
-    ...(conversation?.conversation_parts?.conversation_parts || []).map(part => part.body)
-  ].filter(Boolean);
-
-  for (const source of sources) {
-    if (source) return cleanHtml(source);
+  let parts = conversation?.conversation_parts?.conversation_parts || [];
+  if (parts.length > 0) {
+    // Сортируем по created_at desc и фильтруем user + с body
+    parts = parts
+      .filter(part => part?.author?.type !== 'bot' && part?.body)
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
+    if (parts[0]) return cleanHtml(parts[0].body);
+  }
+  // Fallback на source если нет parts
+  if (conversation?.source?.body && conversation.source.author.type !== 'bot') {
+    return cleanHtml(conversation.source.body);
   }
   return null;
 }
 
-// Clean HTML
 function cleanHtml(text) {
-  return text.replace(/<[^>]+>/g, '').trim();
+  return text.replace(/<[^>]+>/g, '').trim().replace(/\s+/g, ' ');  // Нормализация пробелов
 }
 
-// Translate
 async function translateMessage(text) {
-  // Локальная детекция (без whitelist — детектируем все)
   const francCode = franc(text, { minLength: 3 });
-  console.log(`Franc detected raw code: ${francCode} for text: "${text.substring(0, 50)}..."`);  // Дебаг лог
-
-  let sourceLang = LANG_MAP[francCode] || 'auto';  // Fallback на auto если неизвестный
+  console.log(`Franc raw: ${francCode} for "${text.substring(0, 50)}..."`);
 
   if (francCode === 'und') {
-    console.log('Undetermined language, using auto detect in API');
-    // return null;  // Раскомментируйте, если строго скип und
-  }
-
-  if (sourceLang !== 'auto' && SKIP_LANGS.includes(sourceLang)) {
-    console.log(`Skipping: source lang ${sourceLang} in skip list`);
+    console.log('Skipping: undetermined language');
     return null;
   }
 
-  const cacheKey = `${text}:${TARGET_LANG}`;
+  const sourceLang = LANG_MAP[francCode] || 'auto';
+  if (SKIP_LANGS.includes(sourceLang)) {
+    console.log(`Skipping: ${sourceLang} in skip list`);
+    return null;
+  }
+
+  // Скип если выглядит как код/лицензия (опционально, для вашего случая)
+  if (/^[a-f0-9]{32}$/i.test(text.trim()) || text.match(/license key/i)) {
+    console.log('Skipping: looks like license key');
+    return null;
+  }
+
+  const cacheKey = `${text}:${sourceLang}:${TARGET_LANG}`;
   if (TRANSLATION_CACHE.has(cacheKey)) {
     console.log('Cache hit');
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
   try {
+    const apiSource = sourceLang === 'auto' ? 'auto' : sourceLang;
     const response = await axios.post(
       TRANSLATE_API_URL,
-      { q: text, source: sourceLang, target: TARGET_LANG, format: 'text' },
+      { q: text, source: apiSource, target: TARGET_LANG, format: 'text' },
       { timeout: REQUEST_TIMEOUT }
     );
 
     const translatedText = response.data.translatedText;
     if (!translatedText) return null;
 
-    // Если source был auto, можно взять detected из API (опционально)
-    const finalSource = sourceLang === 'auto' ? response.data.detectedLanguage?.language || 'unknown' : sourceLang;
-
+    const finalSource = apiSource === 'auto' ? (response.data.detectedLanguage?.language || sourceLang) : sourceLang;
     const translation = { text: translatedText, sourceLang: finalSource, targetLang: TARGET_LANG };
     TRANSLATION_CACHE.set(cacheKey, translation);
     return translation;
@@ -154,16 +141,11 @@ async function translateMessage(text) {
   }
 }
 
-// Create note
 async function createInternalNote(conversationId, translation) {
+  // Без изменений
   try {
     const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
-    const notePayload = {
-      message_type: 'note',
-      admin_id: ADMIN_ID,
-      body: noteBody
-    };
-
+    const notePayload = { message_type: 'note', admin_id: ADMIN_ID, body: noteBody };
     await axios.post(
       `https://api.intercom.io/conversations/${conversationId}/reply`,
       notePayload,
@@ -177,7 +159,6 @@ async function createInternalNote(conversationId, translation) {
         timeout: REQUEST_TIMEOUT
       }
     );
-
     console.log('Note created for', conversationId);
   } catch (error) {
     console.error('Note error for', conversationId, ':', error.message);
@@ -185,6 +166,4 @@ async function createInternalNote(conversationId, translation) {
 }
 
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => {
-  console.log(`Server running on port ${PORT}`);
-});
+app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
