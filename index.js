@@ -16,9 +16,15 @@ const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const LANG_MAP = {
+  // ISO 639-1 коды
   'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'cs': 'cs', 'nl': 'nl', 'tr': 'tr',
-  'ar': 'ar', 'zh': 'zh'
+  'ar': 'ar', 'zh': 'zh',
+  // Названия языков из Intercom
+  'English': 'en', 'Russian': 'ru', 'Ukrainian': 'uk', 'Spanish': 'es',
+  'German': 'de', 'French': 'fr', 'Italian': 'it', 'Portuguese': 'pt',
+  'Polish': 'pl', 'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
+  'Arabic': 'ar', 'Chinese': 'zh'
 };
 const INTERCOM_API_VERSION = '2.11';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
@@ -57,8 +63,11 @@ app.post('/intercom-webhook', async (req, res) => {
     // Логируем весь conversation объект для отладки
     if (DEBUG) console.log('Conversation object:', JSON.stringify(conversation, null, 2));
 
-    // Попробуем разные возможные поля для языка
-    let sourceLang = conversation?.language_override || conversation?.language || conversation?.custom_attributes?.language || 'auto';
+    // Извлекаем язык из custom_attributes.Language
+    let sourceLang = conversation?.language_override || 
+                     conversation?.language || 
+                     conversation?.custom_attributes?.Language || 
+                     'auto';
     if (DEBUG) console.log('Detected language from Intercom:', sourceLang);
 
     const translation = await translateMessage(messageText, sourceLang);
@@ -96,11 +105,16 @@ async function translateMessage(text, detectedLang) {
   if (text.length > 1000) text = text.substring(0, 1000);
 
   // Нормализация языка
-  let sourceLang = detectedLang && detectedLang !== 'auto' && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
+  let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
   if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) {
     if (DEBUG) console.log('Skipping translation: Language is undefined or in SKIP_LANGS');
+    return null;
+  }
+
+ primele if (sourceLang === TARGET_LANG) {
+    if (DEBUG) console.log('Skipping translation: Source language matches target language');
     return null;
   }
 
@@ -111,7 +125,7 @@ async function translateMessage(text, detectedLang) {
   }
 
   try {
-    const apiSource = sourceLang === 'auto' ? 'auto' : sourceLang;
+    const apiSource = sourceLang;
     if (DEBUG) console.log(`Sending to translation API: text="${text}", source=${apiSource}, target=${TARGET_LANG}`);
     
     const response = await axiosInstance.post(TRANSLATE_API_URL, {
@@ -132,9 +146,9 @@ async function translateMessage(text, detectedLang) {
     const finalSource = apiSource === 'auto' ? (response.data.detectedLanguage?.language || sourceLang) : sourceLang;
     if (DEBUG) console.log('Final source language:', finalSource);
 
-    // Проверка: если Intercom указал язык, а API перевёл с другого, логируем предупреждение
-    if (detectedLang !== 'auto' && finalSource !== detectedLang && finalSource !== sourceLang) {
-      console.warn(`Warning: Intercom language (${detectedLang}) differs from API detected language (${finalSource})`);
+    // Проверка несоответствия языка
+    if (detectedLang !== 'auto' && finalSource !== sourceLang) {
+      console.warn(`Warning: Intercom language (${detectedLang}/${sourceLang}) differs from API detected language (${finalSource})`);
     }
 
     if (finalSource === TARGET_LANG) {
