@@ -3,9 +3,14 @@
   "version": "1.0.0",
   "description": "Автопереводчик сообщений для Intercom",
   "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
-    "express": "^4.18.2",
-    "body-parser": "^1.20.2",
-    "axios": "^1.6.3"
+    "express": "^4.19.2",
+    "body-parser": "^1.20.3",
+    "axios": "^1.7.7",
+    "dotenv": "^16.4.5"
   }
 }
