@@ -19,11 +19,13 @@ const INTERCOM_API_VERSION = '2.14';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 const TRANSLATION_CACHE = new Map();
 const REQUEST_TIMEOUT = 5000;
-const MIN_TEXT_LENGTH = 30; // Увеличено для исключения коротких фраз
+const MIN_TEXT_LENGTH = 30;
+const CACHE_MAX_SIZE = 1000; // Ограничение размера кэша
 const ENGLISH_KEYWORDS = [
   'okay', 'please', 'thanks', 'sorry', 'update', 'hello', 'hi',
-  'for', 'post', 'image', 'added', 'in', 'an', 'the', 'to'
-]; // Расширенный список
+  'for', 'post', 'image', 'added', 'in', 'an', 'the', 'to',
+  'what', 'can', 'do', 'is', 'it', 'with', 'on', 'and', 'my'
+];
 
 // Проверка переменных окружения при старте
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
@@ -35,6 +37,10 @@ if (!ADMIN_ID) {
   process.exit(1);
 }
 console.log('Server starting with ENABLED:', ENABLED, 'ADMIN_ID:', ADMIN_ID);
+
+// Очистка кэша при старте
+TRANSLATION_CACHE.clear();
+console.log('Translation cache cleared at startup');
 
 // Webhook verification endpoint
 app.get('/intercom-webhook', (req, res) => {
@@ -131,8 +137,19 @@ function cleanHtml(text) {
 async function translateMessage(text) {
   const cacheKey = `${text}:${TARGET_LANG}`;
   if (TRANSLATION_CACHE.has(cacheKey)) {
-    console.log('Using cached translation');
-    return TRANSLATION_CACHE.get(cacheKey);
+    const cachedTranslation = TRANSLATION_CACHE.get(cacheKey);
+    if (SKIP_LANGS.includes(cachedTranslation.sourceLang)) {
+      console.log(`Skipping cached translation for ${cachedTranslation.sourceLang}: ${text}`);
+      return null;
+    }
+    console.log('Using cached translation for:', text, 'Language:', cachedTranslation.sourceLang);
+    return cachedTranslation;
+  }
+  
+  // Ограничение размера кэша
+  if (TRANSLATION_CACHE.size >= CACHE_MAX_SIZE) {
+    TRANSLATION_CACHE.clear();
+    console.log('Translation cache cleared due to size limit');
   }
   
   try {
@@ -193,11 +210,6 @@ async function createInternalNote(conversationId, translation) {
     console.error('Note creation error for conversation', conversationId, ':', error.response?.status, error.response?.data || error.message);
   }
 }
-
-// Очистка кэша для проблемных сообщений
-TRANSLATION_CACHE.delete('okay, please keep update me:en');
-TRANSLATION_CACHE.delete('for 1 post i added an image::en');
-console.log('Cleared cache for problematic messages');
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
