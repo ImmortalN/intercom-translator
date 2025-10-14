@@ -3,8 +3,8 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
-import { franc } from 'franc';  // Базовая детекция для fallback
-import all from 'franc/all';  // Confidence mode из подмодуля
+import { franc } from 'franc';  // Базовая
+import all from 'franc-all';  // Отдельный пакет для confidence
 import NodeCache from 'node-cache';
 
 dotenv.config();
@@ -95,9 +95,9 @@ async function translateMessage(text) {
   let sourceLang;
   let detections = [];
   try {
-    detections = all(text, { minLength: 3 });  // Confidence mode
+    detections = all(text, { minLength: 3 });  // Confidence from franc-all
   } catch (e) {
-    console.error('Franc all error, fallback to basic');
+    console.error('Franc-all error, fallback to basic');
   }
   if (DEBUG) console.log('Franc detections:', detections);
 
@@ -106,7 +106,6 @@ async function translateMessage(text) {
     if (francCode === 'und') return null;
     sourceLang = LANG_MAP[francCode] || 'auto';
   } else {
-    // Fallback к основной franc
     const francCode = franc(text, { minLength: 3 });
     if (DEBUG) console.log('Fallback franc:', francCode);
     if (francCode === 'und') return null;
