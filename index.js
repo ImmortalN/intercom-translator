@@ -9,37 +9,46 @@ const INTERCOM_TOKEN = process.env.INTERCOM_TOKEN;
 const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = process.env.TARGET_LANG || 'en';
 
+// Проверка, что сервер работает
 app.get('/', (req, res) => {
-  res.send('Server is running. Webhook endpoint: /webhook');
+  res.send('✅ Server is running. Webhook endpoint: /webhook');
 });
 
+// Основной обработчик вебхуков
 app.post('/webhook', async (req, res) => {
-  res.sendStatus(200); // сразу отвечаем Intercom
+  res.sendStatus(200); // Intercom требует быстрый ответ
 
   if (!ENABLED) return;
 
-  console.log('Webhook payload:', JSON.stringify(req.body, null, 2));
+  console.log('📩 Incoming webhook:');
+  console.log(JSON.stringify(req.body, null, 2));
 
-  // Попробовать несколько возможных путей для текста
+  // --- 1. Извлекаем текст сообщения из возможных мест ---
   let messageText = req.body?.data?.item?.body ||
                     req.body?.data?.item?.conversation_parts?.[0]?.body ||
+                    req.body?.data?.item?.part?.body ||
                     req.body?.data?.item?.conversation_message?.body;
 
   if (!messageText) {
-    console.log('No message text found. Skipping.');
+    console.log('⚠️ No message text found. Skipping.');
     return;
   }
 
-  // Убираем HTML теги
+  // --- 2. Убираем HTML-теги ---
   messageText = messageText.replace(/<[^>]+>/g, '').trim();
 
-  let conversationId = req.body?.data?.item?.id || req.body?.data?.item?.conversation?.id;
+  // --- 3. Получаем ID диалога ---
+  let conversationId = req.body?.data?.item?.id ||
+                       req.body?.data?.item?.conversation?.id;
+
   if (!conversationId) {
-    console.log('No conversation ID found. Skipping.');
+    console.log('⚠️ No conversation ID found. Skipping.');
     return;
   }
 
+  // --- 4. Переводим сообщение ---
   try {
+    console.log(`🌐 Translating message: "${messageText}"`);
     const translateResponse = await axios.post('https://libretranslate.com/translate', {
       q: messageText,
       source: 'auto',
@@ -48,14 +57,15 @@ app.post('/webhook', async (req, res) => {
     });
 
     const translatedText = translateResponse.data.translatedText;
+    console.log(`✅ Translation result: ${translatedText}`);
 
-    // Правильный endpoint для Internal Note
+    // --- 5. Добавляем перевод как Internal Note ---
     await axios.post(
-      `https://api.intercom.io/conversations/${conversationId}/parts`,
+      `https://api.intercom.io/conversations/${conversationId}/reply`,
       {
         type: 'note',
         message_type: 'comment',
-        body: `📝 Перевод: ${translatedText}`
+        body: `📝 Translation (${TARGET_LANG}): ${translatedText}`
       },
       {
         headers: {
@@ -66,11 +76,11 @@ app.post('/webhook', async (req, res) => {
       }
     );
 
-    console.log(`Message translated for conversation ${conversationId}: ${translatedText}`);
+    console.log(`💬 Note added to conversation ${conversationId}`);
   } catch (err) {
-    console.error('Error translating message:', err.response?.data || err.message);
+    console.error('❌ Error translating or posting note:', err.response?.data || err.message);
   }
 });
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
