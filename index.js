@@ -3,7 +3,8 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
-import { franc, all } from 'franc';  // Правильный импорт: all для confidence
+import { franc } from 'franc';  // Основная детекция
+import all from 'franc/all';  // Confidence mode из подмодуля
 
 dotenv.config();
 
@@ -70,7 +71,7 @@ function extractMessageText(conversation) {
   if (parts.length > 0) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
-      .filter(p => p?.author?.type === 'user' && p?.body)  // Строго user
+      .filter(p => p?.author?.type === 'user' && p?.body)
       .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
     if (parts[0]) return cleanText(parts[0].body);
   }
@@ -90,22 +91,28 @@ function cleanText(text) {
 async function translateMessage(text) {
   if (text.length > 1000) text = text.substring(0, 1000);
 
-  // Полный режим с confidence
-  const detections = all(text, { minLength: 3 });
+  let sourceLang;
+  let detections = [];
+  try {
+    detections = all(text, { minLength: 3 });  // Confidence mode
+  } catch (e) {
+    console.error('Franc all error, fallback to basic');
+  }
   if (DEBUG) console.log('Franc detections:', detections);
-  if (detections.length === 0 || detections[0][1] < 0.5) {
-    // Fallback на простую franc если low conf
+
+  if (detections.length > 0 && detections[0][1] >= 0.5) {
+    const francCode = detections[0][0];
+    if (francCode === 'und') return null;
+    sourceLang = LANG_MAP[francCode] || 'auto';
+  } else {
+    // Fallback к основной franc
     const francCode = franc(text, { minLength: 3 });
     if (DEBUG) console.log('Fallback franc:', francCode);
     if (francCode === 'und') return null;
-    const sourceLang = LANG_MAP[francCode] || 'auto';
-    if (SKIP_LANGS.includes(sourceLang)) return null;
-  } else {
-    const francCode = detections[0][0];
-    if (francCode === 'und') return null;
-    const sourceLang = LANG_MAP[francCode] || 'auto';
-    if (SKIP_LANGS.includes(sourceLang)) return null;
+    sourceLang = LANG_MAP[francCode] || 'auto';
   }
+
+  if (SKIP_LANGS.includes(sourceLang)) return null;
 
   const cacheKey = `${text}:${sourceLang}:${TARGET_LANG}`;
   if (TRANSLATION_CACHE.has(cacheKey)) return TRANSLATION_CACHE.get(cacheKey);
