@@ -2,6 +2,7 @@ import express from 'express';
 import bodyParser from 'body-parser';
 import axios from 'axios';
 import dotenv from 'dotenv';
+import { franc } from 'franc-min';
 
 dotenv.config();
 
@@ -18,8 +19,11 @@ const INTERCOM_API_VERSION = '2.14';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 const TRANSLATION_CACHE = new Map();
 const REQUEST_TIMEOUT = 5000;
-const MIN_TEXT_LENGTH = 10; // Минимальная длина текста для перевода
-const ENGLISH_KEYWORDS = ['okay', 'please', 'thanks', 'sorry', 'update', 'hello', 'hi']; // Простой фильтр для английского
+const MIN_TEXT_LENGTH = 30; // Увеличено для исключения коротких фраз
+const ENGLISH_KEYWORDS = [
+  'okay', 'please', 'thanks', 'sorry', 'update', 'hello', 'hi',
+  'for', 'post', 'image', 'added', 'in', 'an', 'the', 'to'
+]; // Расширенный список
 
 // Проверка переменных окружения при старте
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
@@ -63,6 +67,7 @@ app.post('/intercom-webhook', async (req, res) => {
     
     const messageText = extractMessageText(conversation);
     if (!messageText || messageText.length < MIN_TEXT_LENGTH) {
+      console.log(`Skipping short message: ${messageText}`);
       return;
     }
     
@@ -75,7 +80,14 @@ app.post('/intercom-webhook', async (req, res) => {
       messageText.toLowerCase().includes(keyword)
     );
     if (isLikelyEnglish) {
-      console.log('Message likely English based on keywords, skipping translation:', messageText);
+      console.log('Message likely English based on keywords, skipping:', messageText);
+      return;
+    }
+    
+    // Локальная проверка языка через franc
+    const francLang = franc(messageText, { minLength: 3 });
+    if (francLang === 'eng') {
+      console.log('Franc detected English, skipping:', messageText);
       return;
     }
     
@@ -182,9 +194,10 @@ async function createInternalNote(conversationId, translation) {
   }
 }
 
-// Очистка кэша для проблемного сообщения
+// Очистка кэша для проблемных сообщений
 TRANSLATION_CACHE.delete('okay, please keep update me:en');
-console.log('Cleared cache for "okay, please keep update me"');
+TRANSLATION_CACHE.delete('for 1 post i added an image::en');
+console.log('Cleared cache for problematic messages');
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
