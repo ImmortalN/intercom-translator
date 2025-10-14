@@ -10,9 +10,10 @@ app.use(bodyParser.json());
 
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
+const ADMIN_ID = process.env.ADMIN_ID; // Обязательно! Например, 5475435
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
-const INTERCOM_API_VERSION = '2.9'; // Смените, если в Intercom Webhook другая версия
+const INTERCOM_API_VERSION = '2.14'; // Ваша версия API
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 
 // Webhook verification endpoint
@@ -28,13 +29,17 @@ app.post('/intercom-webhook', async (req, res) => {
     res.sendStatus(200);
     
     console.log('Webhook received:', JSON.stringify(req.body, null, 2));
-    
+
     if (!INTERCOM_TOKEN) {
       console.error('Missing INTERCOM_TOKEN');
       return;
     }
-    console.log('INTERCOM_TOKEN is set (length):', INTERCOM_TOKEN.length);
-    
+    if (!ADMIN_ID) {
+      console.error('Missing ADMIN_ID');
+      return;
+    }
+    console.log(`Using ADMIN_ID: ${ADMIN_ID}`);
+
     const { topic, data } = req.body;
     
     // Only process user messages
@@ -42,40 +47,40 @@ app.post('/intercom-webhook', async (req, res) => {
       console.log(`Ignoring topic: ${topic}`);
       return;
     }
-    
+
     const conversation = data?.item;
     const conversationId = conversation?.id;
-    const contactId = conversation?.contacts?.contacts?.[0]?.id || 
-                     conversation?.source?.author?.id;
+    const contactId = conversation?.contacts?.contacts?.[0]?.id || conversation?.source?.author?.id;
     
     console.log(`Conversation ID: ${conversationId}, Contact ID: ${contactId}`);
-    
-    if (!conversationId || !contactId) {
-      console.log('No conversation ID or contact ID found');
+    if (!conversationId) {
+      console.log('No conversation ID found');
       return;
     }
-    
+
+    // Extract message text from various possible locations
     let messageText = extractMessageText(conversation);
     
     if (!messageText || messageText.length < 2) {
       console.log('No valid message text found');
       return;
     }
-    
+
     console.log(`Processing message: ${messageText}, Author type: ${conversation?.source?.author?.type || 'unknown'}`);
-    
     if (conversation?.source?.author?.type === 'bot') {
       console.log('Message from bot - skipping');
       return;
     }
-    
+
+    // Translate the message
     const translation = await translateMessage(messageText);
     
     if (!translation) {
       console.log('Translation failed or not needed');
       return;
     }
-    
+
+    // Create internal note with translation
     await createInternalNote(conversationId, translation);
     
   } catch (error) {
@@ -126,7 +131,7 @@ async function translateMessage(text) {
       target: TARGET_LANG,
       format: 'text'
     });
-    
+
     const { translatedText, detectedLanguage } = response.data;
     const sourceLang = detectedLanguage?.language?.toLowerCase() || 'unknown';
     
@@ -157,7 +162,8 @@ async function createInternalNote(conversationId, translation) {
     const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
     
     const notePayload = {
-      type: 'note',
+      message_type: "comment",
+      admin_id: ADMIN_ID,
       body: noteBody
     };
     
