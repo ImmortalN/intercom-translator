@@ -11,7 +11,7 @@ app.use(bodyParser.json());
 
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
-const ADMIN_ID = process.env.ADMIN_ID; // Убедитесь, что ADMIN_ID=5475435 в Render
+const ADMIN_ID = process.env.ADMIN_ID; // Убедитесь, что ADMIN_ID=3183781 в Render
 const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
