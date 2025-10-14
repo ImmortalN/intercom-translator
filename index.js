@@ -83,7 +83,7 @@ function extractMessageText(conversation) {
 
 function cleanText(text) {
   if (!text) return '';
-  text = text.replace(/license key[:\s]*[a-f0-9]{32}/gi, '').trim();
+  text = text.replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '').trim();
   text = text.replace(/<[^>]+>/g, '').replace(/\s+/g, ' ').replace(/https?:\S+/g, '').trim();
   return text;
 }
