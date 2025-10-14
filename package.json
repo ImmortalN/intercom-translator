@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "description": "Автопереводчик сообщений для Intercom",
   "main": "index.js",
-  "type": "module",  // Добавьте эту строку
+  "type": "module",  // Это устранит warning в Node.js
   "scripts": {
     "start": "node index.js"
   },
@@ -11,6 +11,8 @@
     "express": "^4.19.2",
     "body-parser": "^1.20.3",
     "axios": "^1.7.7",
-    "dotenv": "^16.4.5"
+    "dotenv": "^16.4.5",
+    "franc": "^6.2.0",  // Для локальной детекции языка
+    "node-cache": "^5.1.2"  // Для кэша с TTL
   }
 }
