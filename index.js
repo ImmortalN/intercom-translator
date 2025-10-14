@@ -20,7 +20,7 @@ const LANG_MAP = {
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'cs': 'cs', 'nl': 'nl', 'tr': 'tr',
   'ar': 'ar', 'zh': 'zh'
 };
-const INTERCOM_API_VERSION = '2.11'; // Используем версию 2.11, как в документации
+const INTERCOM_API_VERSION = '2.11';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
 const REQUEST_TIMEOUT = 3000;
@@ -44,7 +44,7 @@ app.post('/intercom-webhook', async (req, res) => {
     res.sendStatus(200);
     if (!ENABLED) return;
     const { topic, data } = req.body;
-    if (!['conversation.user.replied', 'conversation.user.created'].includes(topic)) return; // Исправлено: убрал дефис
+    if (!['conversation.user.replied', 'conversation.user.created'].includes(topic)) return;
 
     const conversation = data?.item;
     const conversationId = conversation?.id;
@@ -54,12 +54,12 @@ app.post('/intercom-webhook', async (req, res) => {
     if (DEBUG) console.log(`Extracted: "${messageText}"`);
     if (!messageText || messageText.length < 3) return;
 
-    // Логируем весь conversation объект для отладки, чтобы найти поле языка
+    // Логируем весь conversation объект для отладки
     if (DEBUG) console.log('Conversation object:', JSON.stringify(conversation, null, 2));
 
     // Попробуем разные возможные поля для языка
     let sourceLang = conversation?.language_override || conversation?.language || conversation?.custom_attributes?.language || 'auto';
-    if (DEBUG) console.log('Detected language:', sourceLang);
+    if (DEBUG) console.log('Detected language from Intercom:', sourceLang);
 
     const translation = await translateMessage(messageText, sourceLang);
     if (!translation) return;
@@ -97,15 +97,23 @@ async function translateMessage(text, detectedLang) {
 
   // Нормализация языка
   let sourceLang = detectedLang && detectedLang !== 'auto' && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
-  if (DEBUG) console.log('Using source lang:', sourceLang);
+  if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
-  if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) return null;
+  if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) {
+    if (DEBUG) console.log('Skipping translation: Language is undefined or in SKIP_LANGS');
+    return null;
+  }
 
   const cacheKey = `${text}:${sourceLang}:${TARGET_LANG}`;
-  if (TRANSLATION_CACHE.has(cacheKey)) return TRANSLATION_CACHE.get(cacheKey);
+  if (TRANSLATION_CACHE.has(cacheKey)) {
+    if (DEBUG) console.log('Returning cached translation');
+    return TRANSLATION_CACHE.get(cacheKey);
+  }
 
   try {
-    const apiSource = sourceLang;
+    const apiSource = sourceLang === 'auto' ? 'auto' : sourceLang;
+    if (DEBUG) console.log(`Sending to translation API: text="${text}", source=${apiSource}, target=${TARGET_LANG}`);
+    
     const response = await axiosInstance.post(TRANSLATE_API_URL, {
       q: text,
       source: apiSource,
@@ -114,10 +122,25 @@ async function translateMessage(text, detectedLang) {
     });
 
     let translatedText = response.data.translatedText;
-    if (!translatedText || translatedText.trim() === text.trim()) return null;
+    if (DEBUG) console.log('Translation API response:', JSON.stringify(response.data, null, 2));
+
+    if (!translatedText || translatedText.trim() === text.trim()) {
+      if (DEBUG) console.log('Translation failed: No translation or same as input');
+      return null;
+    }
 
     const finalSource = apiSource === 'auto' ? (response.data.detectedLanguage?.language || sourceLang) : sourceLang;
-    if (finalSource === TARGET_LANG) return null;
+    if (DEBUG) console.log('Final source language:', finalSource);
+
+    // Проверка: если Intercom указал язык, а API перевёл с другого, логируем предупреждение
+    if (detectedLang !== 'auto' && finalSource !== detectedLang && finalSource !== sourceLang) {
+      console.warn(`Warning: Intercom language (${detectedLang}) differs from API detected language (${finalSource})`);
+    }
+
+    if (finalSource === TARGET_LANG) {
+      if (DEBUG) console.log('Skipping: Source language matches target language');
+      return null;
+    }
 
     const translation = { text: translatedText, sourceLang: finalSource, targetLang: TARGET_LANG };
     TRANSLATION_CACHE.set(cacheKey, translation);
@@ -143,6 +166,7 @@ async function createInternalNote(conversationId, translation) {
         }
       }
     );
+    if (DEBUG) console.log('Internal note created successfully');
   } catch (error) {
     console.error('Note error:', error.message);
   }
