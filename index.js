@@ -12,7 +12,8 @@ const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
-const INTERCOM_API_VERSION = '2.9'; // Смените на вашу версию из Intercom Webhook settings (или 'Unversioned')
+const INTERCOM_API_VERSION = '2.14'; // Смените, если в Intercom Webhook другая версия
+const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate'; // LibreTranslate сервер
 
 app.get('/intercom-webhook', (req, res) => {
   console.log('Received GET test webhook:', JSON.stringify(req.query, null, 2));
@@ -50,21 +51,30 @@ app.post('/intercom-webhook', async (req, res) => {
 
     // Извлечение текста
     let messageText = '';
+    let authorType = '';
     const parts = conversation?.conversation_parts?.conversation_parts || [];
     const lastPart = parts.slice(-1)[0];
     const firstPart = parts[0];
-    if (lastPart && lastPart.author?.type === 'user' && lastPart.body) {
+    if (lastPart && lastPart.author?.type !== 'bot' && lastPart.body) {
       messageText = lastPart.body.replace(/<[^>]+>/g, '').trim();
-    } else if (firstPart && firstPart.author?.type === 'user' && firstPart.body) {
+      authorType = lastPart.author.type;
+    } else if (firstPart && firstPart.author?.type !== 'bot' && firstPart.body) {
       messageText = firstPart.body.replace(/<[^>]+>/g, '').trim();
-    } else if (conversation?.source?.body) {
+      authorType = firstPart.author.type;
+    } else if (conversation?.source?.body && conversation?.source?.author?.type !== 'bot') {
       messageText = conversation.source.body.replace(/<[^>]+>/g, '').trim();
-    } else if (conversation?.body) {
+      authorType = conversation.source.author.type;
+    } else if (conversation?.body && conversation?.source?.author?.type !== 'bot') {
       messageText = conversation.body.replace(/<[^>]+>/g, '').trim();
+      authorType = conversation.source.author.type;
     }
-    console.log(`Extracted message text: ${messageText}`);
+    console.log(`Extracted message text: ${messageText}, Author type: ${authorType}`);
     if (!messageText || messageText.length < 2) {
       console.log('Empty or too short message - skipping');
+      return res.sendStatus(200);
+    }
+    if (authorType === 'bot') {
+      console.log('Message from bot - skipping');
       return res.sendStatus(200);
     }
 
@@ -98,12 +108,13 @@ app.post('/intercom-webhook', async (req, res) => {
     let sourceLang = '';
     let translatedText = '';
     try {
-      const translateRes = await axios.post('https://libretranslate.de/translate', {
+      const translateRes = await axios.post(TRANSLATE_API_URL, {
         q: messageText,
         source: 'auto',
         target: TARGET_LANG,
         format: 'text'
       });
+      console.log('LibreTranslate response:', JSON.stringify(translateRes.data, null, 2));
       sourceLang = translateRes.data.detectedLanguage?.language?.toLowerCase() || 'auto';
       translatedText = translateRes.data.translatedText;
       console.log(`Detected language: ${sourceLang}, Translated: ${translatedText}`);
