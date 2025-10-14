@@ -3,44 +3,52 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import dotenv from 'dotenv';
 import { franc } from 'franc-min';
+import pino from 'pino';
 
 dotenv.config();
 
 const app = express();
 app.use(bodyParser.json());
 
+// Logger
+const logger = pino({ level: process.env.LOG_LEVEL || 'info' });
+
 // Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
-const ADMIN_ID = process.env.ADMIN_ID; // Убедитесь, что ADMIN_ID=3183781 в Render
+const ADMIN_ID = process.env.ADMIN_ID;
 const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.14';
 const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 const TRANSLATION_CACHE = new Map();
+const HTML_CACHE = new Map(); // Кэш для cleanHtml
 const REQUEST_TIMEOUT = 5000;
 const MIN_TEXT_LENGTH = 30;
 const CACHE_MAX_SIZE = 1000;
+const CACHE_TTL = 24 * 60 * 60 * 1000; // 24 часа
+const MAX_NOTE_LENGTH = 1000; // Ограничение длины заметки
 const ENGLISH_KEYWORDS = [
   'okay', 'please', 'thanks', 'sorry', 'update', 'hello', 'hi',
   'for', 'post', 'image', 'added', 'in', 'an', 'the', 'to',
   'what', 'can', 'do', 'is', 'it', 'with', 'on', 'and', 'my'
 ];
 
-// Проверка переменных окружения при старте
+// Проверка переменных окружения
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') {
-  console.error('Fatal: INTERCOM_TOKEN is missing or invalid');
+  logger.error('Fatal: INTERCOM_TOKEN is missing or invalid');
   process.exit(1);
 }
 if (!ADMIN_ID) {
-  console.error('Fatal: ADMIN_ID is missing');
+  logger.error('Fatal: ADMIN_ID is missing');
   process.exit(1);
 }
-console.log('Server starting with ENABLED:', ENABLED, 'ADMIN_ID:', ADMIN_ID);
+logger.info({ ENABLED, ADMIN_ID }, 'Server starting');
 
 // Очистка кэша при старте
 TRANSLATION_CACHE.clear();
-console.log('Translation cache cleared at startup');
+HTML_CACHE.clear();
+logger.info('Caches cleared at startup');
 
 // Webhook verification endpoint
 app.get('/intercom-webhook', (req, res) => {
@@ -54,7 +62,7 @@ app.post('/intercom-webhook', async (req, res) => {
     res.sendStatus(200);
     
     if (!ENABLED) {
-      console.log('Webhook processing disabled (ENABLED=false)');
+      logger.info('Webhook processing disabled (ENABLED=false)');
       return;
     }
     
@@ -73,7 +81,7 @@ app.post('/intercom-webhook', async (req, res) => {
     
     const messageText = extractMessageText(conversation);
     if (!messageText || messageText.length < MIN_TEXT_LENGTH) {
-      console.log(`Skipping short message: ${messageText}`);
+      logger.info({ messageText }, 'Skipping short message');
       return;
     }
     
@@ -86,14 +94,14 @@ app.post('/intercom-webhook', async (req, res) => {
       messageText.toLowerCase().includes(keyword)
     );
     if (isLikelyEnglish) {
-      console.log('Message likely English based on keywords, skipping:', messageText);
+      logger.info({ messageText }, 'Message likely English based on keywords, skipping');
       return;
     }
     
     // Локальная проверка языка через franc
     const francLang = franc(messageText, { minLength: 3 });
     if (francLang === 'eng') {
-      console.log('Franc detected English, skipping:', messageText);
+      logger.info({ messageText }, 'Franc detected English, skipping');
       return;
     }
     
@@ -104,10 +112,10 @@ app.post('/intercom-webhook', async (req, res) => {
     
     await createInternalNote(conversationId, translation);
     
-    console.log(`Webhook processed for conversation ${conversationId} in ${Date.now() - start}ms`);
+    logger.info({ conversationId, duration: Date.now() - start }, 'Webhook processed');
     
   } catch (error) {
-    console.error('Webhook error:', error.response?.status || error.message);
+    logger.error({ error: error.response?.status || error.message }, 'Webhook error');
   }
 });
 
@@ -128,9 +136,18 @@ function extractMessageText(conversation) {
   return null;
 }
 
-// Clean HTML tags
+// Clean HTML tags with caching
 function cleanHtml(text) {
-  return text.replace(/<[^>]+>/g, '').trim();
+  if (HTML_CACHE.has(text)) {
+    return HTML_CACHE.get(text);
+  }
+  const cleaned = text.replace(/<[^>]*>/g, '').trim();
+  HTML_CACHE.set(text, cleaned);
+  if (HTML_CACHE.size >= CACHE_MAX_SIZE) {
+    HTML_CACHE.clear();
+    logger.info('HTML cache cleared due to size limit');
+  }
+  return cleaned;
 }
 
 // Translate message with caching
@@ -139,16 +156,16 @@ async function translateMessage(text) {
   if (TRANSLATION_CACHE.has(cacheKey)) {
     const cachedTranslation = TRANSLATION_CACHE.get(cacheKey);
     if (SKIP_LANGS.includes(cachedTranslation.sourceLang)) {
-      console.log(`Skipping cached translation for ${cachedTranslation.sourceLang}: ${text}`);
+      logger.info({ sourceLang: cachedTranslation.sourceLang, text }, 'Skipping cached translation');
       return null;
     }
-    console.log('Using cached translation for:', text, 'Language:', cachedTranslation.sourceLang);
+    logger.info({ text, sourceLang: cachedTranslation.sourceLang }, 'Using cached translation');
     return cachedTranslation;
   }
   
   if (TRANSLATION_CACHE.size >= CACHE_MAX_SIZE) {
     TRANSLATION_CACHE.clear();
-    console.log('Translation cache cleared due to size limit');
+    logger.info('Translation cache cleared due to size limit');
   }
   
   try {
@@ -161,19 +178,32 @@ async function translateMessage(text) {
     const { translatedText, detectedLanguage } = response.data;
     const sourceLang = detectedLanguage?.language?.toLowerCase() || 'unknown';
     
-    console.log(`Detected language: ${sourceLang}, Confidence: ${detectedLanguage?.confidence || 'unknown'}`);
+    logger.info({ sourceLang, confidence: detectedLanguage?.confidence || 'unknown' }, 'Detected language');
     
     if (SKIP_LANGS.includes(sourceLang)) {
-      console.log(`Skipping translation for ${sourceLang}: ${text}`);
+      logger.info({ sourceLang, text }, 'Skipping translation');
       return null;
     }
     
-    const translation = { text: translatedText, sourceLang, targetLang: TARGET_LANG };
+    const translation = { 
+      text: translatedText.slice(0, MAX_NOTE_LENGTH), 
+      sourceLang, 
+      targetLang: TARGET_LANG, 
+      timestamp: Date.now() 
+    };
     TRANSLATION_CACHE.set(cacheKey, translation);
+    
+    // Очистка старых записей кэша
+    for (const [key, value] of TRANSLATION_CACHE) {
+      if (Date.now() - value.timestamp > CACHE_TTL) {
+        TRANSLATION_CACHE.delete(key);
+      }
+    }
+    
     return translation;
     
   } catch (error) {
-    console.error('Translation error:', error.response?.status || error.message);
+    logger.error({ error: error.response?.status || error.message }, 'Translation error');
     return null;
   }
 }
@@ -203,14 +233,14 @@ async function createInternalNote(conversationId, translation) {
       }
     );
     
-    console.log('Note created for conversation', conversationId, 'Status:', response.status);
+    logger.info({ conversationId, status: response.status }, 'Note created');
     
   } catch (error) {
-    console.error('Note creation error for conversation', conversationId, ':', error.response?.status, error.response?.data || error.message);
+    logger.error({ conversationId, error: error.response?.status, details: error.response?.data || error.message }, 'Note creation error');
   }
 }
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Translation webhook server running on port ${PORT}`);
+  logger.info(`Translation webhook server running on port ${PORT}`);
 });
