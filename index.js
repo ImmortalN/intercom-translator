@@ -3,8 +3,9 @@ import bodyParser from 'body-parser';
 import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
-import { franc } from 'franc';  // Основная детекция
+import { franc } from 'franc';  // Базовая детекция для fallback
 import all from 'franc/all';  // Confidence mode из подмодуля
+import NodeCache from 'node-cache';
 
 dotenv.config();
 
