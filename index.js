@@ -113,7 +113,7 @@ async function translateMessage(text, detectedLang) {
     return null;
   }
 
- primele if (sourceLang === TARGET_LANG) {
+  if (sourceLang === TARGET_LANG) {
     if (DEBUG) console.log('Skipping translation: Source language matches target language');
     return null;
   }
