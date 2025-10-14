@@ -8,162 +8,180 @@ dotenv.config();
 const app = express();
 app.use(bodyParser.json());
 
+// Configuration
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.9'; // Смените, если в Intercom Webhook другая версия
-const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate'; // LibreTranslate сервер
+const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 
+// Webhook verification endpoint
 app.get('/intercom-webhook', (req, res) => {
-  console.log('Received GET test webhook:', JSON.stringify(req.query, null, 2));
-  res.status(200).send('Webhook test successful');
+  console.log('Webhook verification:', JSON.stringify(req.query, null, 2));
+  res.status(200).send('Webhook verified');
 });
 
+// Main webhook handler
 app.post('/intercom-webhook', async (req, res) => {
   try {
-    console.log('Webhook POST received. Full payload:', JSON.stringify(req.body, null, 2));
+    // Always respond 200 first to avoid webhook timeout
+    res.sendStatus(200);
+    
+    console.log('Webhook received:', JSON.stringify(req.body, null, 2));
 
     if (!INTERCOM_TOKEN) {
-      console.error('Missing env var: INTERCOM_TOKEN');
-      return res.sendStatus(500);
+      console.error('Missing INTERCOM_TOKEN');
+      return;
     }
 
-    const topic = req.body?.topic;
-    console.log(`Topic: ${topic}`);
+    const { topic, data } = req.body;
+    
+    // Only process user messages
     if (!['conversation.user.replied', 'conversation.user.created'].includes(topic)) {
-      console.log(`Ignored topic: ${topic}`);
-      return res.sendStatus(200);
+      console.log(`Ignoring topic: ${topic}`);
+      return;
     }
 
-    const conversation = req.body?.data?.item;
+    const conversation = data?.item;
     const conversationId = conversation?.id;
-    console.log(`Conversation ID: ${conversationId}`);
-    if (!conversationId) {
-      console.log('No conversation ID - skipping');
-      return res.sendStatus(200);
-    }
-
-    // Извлечение contact_id
     const contactId = conversation?.contacts?.contacts?.[0]?.id || conversation?.source?.author?.id;
-    console.log(`Contact ID: ${contactId}`);
-    if (!contactId) {
-      console.log('No contact ID - skipping');
-      return res.sendStatus(200);
+    
+    console.log(`Conversation ID: ${conversationId}, Contact ID: ${contactId}`);
+    if (!conversationId || !contactId) {
+      console.log('No conversation ID or contact ID found');
+      return;
     }
 
-    // Дебаг структуры
-    console.log('Conversation parts structure:', JSON.stringify(conversation?.conversation_parts, null, 2));
-    console.log('Conversation body:', conversation?.body);
-    console.log('Source body:', conversation?.source?.body);
-
-    // Извлечение текста
-    let messageText = '';
-    let authorType = '';
-    const parts = conversation?.conversation_parts?.conversation_parts || [];
-    const lastPart = parts.slice(-1)[0];
-    const firstPart = parts[0];
-    if (lastPart && lastPart.author?.type !== 'bot' && lastPart.body) {
-      messageText = lastPart.body.replace(/<[^>]+>/g, '').trim();
-      authorType = lastPart.author.type;
-    } else if (firstPart && firstPart.author?.type !== 'bot' && firstPart.body) {
-      messageText = firstPart.body.replace(/<[^>]+>/g, '').trim();
-      authorType = firstPart.author.type;
-    } else if (conversation?.source?.body && conversation?.source?.author?.type !== 'bot') {
-      messageText = conversation.source.body.replace(/<[^>]+>/g, '').trim();
-      authorType = conversation.source.author.type;
-    } else if (conversation?.body && conversation?.source?.author?.type !== 'bot') {
-      messageText = conversation.body.replace(/<[^>]+>/g, '').trim();
-      authorType = conversation.source.author.type;
-    }
-    console.log(`Extracted message text: ${messageText}, Author type: ${authorType}`);
+    // Extract message text from various possible locations
+    let messageText = extractMessageText(conversation);
+    
     if (!messageText || messageText.length < 2) {
-      console.log('Empty or too short message - skipping');
-      return res.sendStatus(200);
+      console.log('No valid message text found');
+      return;
     }
-    if (authorType === 'bot') {
+
+    console.log(`Processing message: ${messageText}, Author type: ${conversation?.source?.author?.type || 'unknown'}`);
+    if (conversation?.source?.author?.type === 'bot') {
       console.log('Message from bot - skipping');
-      return res.sendStatus(200);
+      return;
     }
 
-    // Hardcoded note для теста (раскомментируйте для проверки API)
-    /*
-    const noteBody = 'Test note from webhook';
-    const replyPayload = {
-      contact: { id: contactId },
-      body: noteBody
-    };
-    console.log('Sending test note to Intercom:', replyPayload);
-    const replyRes = await axios.post(
-      'https://api.intercom.io/notes',
-      replyPayload,
-      {
-        headers: {
-          Authorization: INTERCOM_TOKEN,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'Intercom-Version': INTERCOM_API_VERSION
-        }
-      }
-    );
-    console.log('Intercom test note response:', replyRes.status, replyRes.data);
-    return res.sendStatus(200);
-    */
-
-    // Детекция и перевод через LibreTranslate
-    let sourceLang = '';
-    let translatedText = '';
-    try {
-      const translateRes = await axios.post(TRANSLATE_API_URL, {
-        q: messageText,
-        source: 'auto',
-        target: TARGET_LANG,
-        format: 'text'
-      });
-      console.log('LibreTranslate response:', JSON.stringify(translateRes.data, null, 2));
-      sourceLang = translateRes.data.detectedLanguage?.language?.toLowerCase() || 'auto';
-      translatedText = translateRes.data.translatedText;
-      console.log(`Detected language: ${sourceLang}, Translated: ${translatedText}`);
-    } catch (err) {
-      console.error('Translation failed:', err.response?.status, err.response?.data || err.message);
-      return res.sendStatus(200);
-    }
-    if (!translatedText) {
-      console.log('Translation returned empty');
-      return res.sendStatus(200);
+    // Translate the message
+    const translation = await translateMessage(messageText);
+    
+    if (!translation) {
+      console.log('Translation failed or not needed');
+      return;
     }
 
-    if (!sourceLang || SKIP_LANGS.includes(sourceLang)) {
-      console.log(`Skipping translation for lang ${sourceLang}`);
-      return res.sendStatus(200);
-    }
-
-    // Реальный note
-    const noteBody = `📝 Auto-translation (${sourceLang} → ${TARGET_LANG}): ${translatedText}\n\nOriginal: ${messageText}`;
-    const replyPayload = {
-      contact: { id: contactId },
-      body: noteBody
-    };
-    console.log('Sending note to Intercom:', replyPayload);
-    const replyRes = await axios.post(
-      'https://api.intercom.io/notes',
-      replyPayload,
-      {
-        headers: {
-          Authorization: INTERCOM_TOKEN,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'Intercom-Version': INTERCOM_API_VERSION
-        }
-      }
-    );
-    console.log('Intercom response:', replyRes.status, replyRes.data);
-
-    res.sendStatus(200);
-  } catch (err) {
-    console.error('Error details:', err.response?.status, err.response?.data || err.message, err.stack);
-    res.sendStatus(500);
+    // Create internal note with translation
+    await createTranslationNote(conversationId, translation, messageText);
+    
+  } catch (error) {
+    console.error('Webhook error:', error.response?.status, error.response?.data || error.message, error.stack);
   }
 });
 
+// Extract message text from conversation payload
+function extractMessageText(conversation) {
+  const parts = conversation?.conversation_parts?.conversation_parts || [];
+  
+  // Try last part first (most recent message)
+  const lastPart = parts[parts.length - 1];
+  if (lastPart?.author?.type !== 'bot' && lastPart.body) {
+    return cleanHtml(lastPart.body);
+  }
+  
+  // Try first part
+  const firstPart = parts[0];
+  if (firstPart?.author?.type !== 'bot' && firstPart.body) {
+    return cleanHtml(firstPart.body);
+  }
+  
+  // Try source body
+  if (conversation?.source?.body && conversation?.source?.author?.type !== 'bot') {
+    return cleanHtml(conversation.source.body);
+  }
+  
+  // Try conversation body
+  if (conversation?.body && conversation?.source?.author?.type !== 'bot') {
+    return cleanHtml(conversation.body);
+  }
+  
+  return null;
+}
+
+// Clean HTML tags from message
+function cleanHtml(text) {
+  return text.replace(/<[^>]+>/g, '').trim();
+}
+
+// Translate message using LibreTranslate
+async function translateMessage(text) {
+  try {
+    const response = await axios.post(TRANSLATE_API_URL, {
+      q: text,
+      source: 'auto',
+      target: TARGET_LANG,
+      format: 'text'
+    });
+
+    const { translatedText, detectedLanguage } = response.data;
+    const sourceLang = detectedLanguage?.language?.toLowerCase() || 'unknown';
+    
+    console.log(`LibreTranslate response:`, JSON.stringify(response.data, null, 2));
+    console.log(`Detected: ${sourceLang}, Translated: ${translatedText}`);
+    
+    // Skip if source language should be ignored
+    if (SKIP_LANGS.includes(sourceLang)) {
+      console.log(`Skipping translation for ${sourceLang}`);
+      return null;
+    }
+    
+    return {
+      text: translatedText,
+      sourceLang,
+      targetLang: TARGET_LANG
+    };
+    
+  } catch (error) {
+    console.error('Translation error:', error.response?.status, error.response?.data || error.message);
+    return null;
+  }
+}
+
+// Create internal note with translation
+async function createTranslationNote(conversationId, translation, originalText) {
+  try {
+    const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}\n\nOriginal: ${originalText}`;
+    
+    const replyPayload = {
+      type: 'note',
+      body: noteBody
+    };
+    
+    console.log('Sending note to Intercom:', replyPayload);
+    const response = await axios.post(
+      `https://api.intercom.io/conversations/${conversationId}/reply`,
+      replyPayload,
+      {
+        headers: {
+          Authorization: INTERCOM_TOKEN,
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+          'Intercom-Version': INTERCOM_API_VERSION
+        }
+      }
+    );
+    
+    console.log('Intercom response:', response.status, JSON.stringify(response.data, null, 2));
+    
+  } catch (error) {
+    console.error('Note creation error:', error.response?.status, error.response?.data || error.message, error.stack);
+  }
+}
+
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
+app.listen(PORT, () => {
+  console.log(`Translation webhook server running on port ${PORT}`);
+});
