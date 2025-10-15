@@ -30,9 +30,11 @@ const LANG_MAP = {
   'ko': 'ko', 'ja': 'ja'  // Добавил корейский и японский на случай
 };
 const INTERCOM_API_VERSION = '2.11';
-const TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
+const PRIMARY_TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';  // Primary: libretranslate
+const FALLBACK_TRANSLATE_API_URL = 'https://libretranslate.com/translate';  // Fallback: официальный libretranslate (лучше стабильность)
+const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';  // Additional fallback: MyMemory (free, с лимитами, но хороший для детекции)
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
-const REQUEST_TIMEOUT = 5000;  // Увеличил таймаут для стабильности
+const REQUEST_TIMEOUT = 5000;
 const DEBUG = process.env.DEBUG === 'true';
 
 const axiosInstance = axios.create({
@@ -61,16 +63,14 @@ app.post('/intercom-webhook', async (req, res) => {
 
     const messageText = extractMessageText(conversation);
     if (DEBUG) console.log(`Extracted: "${messageText}"`);
-    if (!messageText || messageText.length < 5) return;  // Увеличил мин. длину для избежания шумных коротких сообщений
+    if (!messageText || messageText.length < 3) return;  // Уменьшил мин. длину до 3 символов (для "No" или коротких фраз, если нужно переводить)
 
-    // Логируем весь conversation объект для отладки
     if (DEBUG) console.log('Conversation object:', JSON.stringify(conversation, null, 2));
 
-    // Извлекаем язык из custom_attributes.Language или других полей
     let detectedLang = conversation?.language_override || 
                        conversation?.language || 
                        conversation?.custom_attributes?.Language || 
-                       conversation?.source?.language ||  // Добавил source.language если есть
+                       conversation?.source?.language || 
                        'auto';
     if (DEBUG) console.log('Detected language from Intercom:', detectedLang);
 
@@ -104,22 +104,20 @@ function extractMessageText(conversation) {
 
 function cleanText(text) {
   if (!text) return '';
-  // Более агрессивная очистка: теги, атрибуты, скрипты, UI-артефакты
-  text = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')  // Удаляем скрипты
+  text = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
               .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-              .replace(/<[^>]+>/g, ' ')  // Теги на пробел
+              .replace(/<[^>]+>/g, ' ')
               .replace(/id="[^"]*"/gi, '') 
               .replace(/class="[^"]*"/gi, '')
               .replace(/menu-item-\d+/gi, '')
               .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
               .replace(/https?:\S+/g, '')
-              .replace(/&nbsp;|\u00A0/g, ' ')  // Non-breaking spaces
-              .replace(/\s+/g, ' ')  // Схлопываем пробелы
+              .replace(/&nbsp;|\u00A0|\u200B/g, ' ')  // Убрал zero-width spaces как в вашем логе 
+              .replace(/\s+/g, ' ')
               .trim();
 
-  // Фильтр на мусор: если содержит атрибуты или выглядит как код, или слишком короткий/бессмысленный
-  if (/[a-zA-Z]="[^"]*"/.test(text) || /menu|select|option|dropdown/.test(text.toLowerCase()) || 
-      text.length < 5 || !/[a-zA-Z\u4e00-\u9fff]/.test(text)) {  // Проверяем на наличие букв/иероглифов
+  // Ослабил фильтр мусора: теперь только если содержит атрибуты или UI-слова, но позволяет короткие осмысленные фразы
+  if (/[a-zA-Z]="[^"]*"/.test(text) || /menu|select|option|dropdown/.test(text.toLowerCase())) {
     if (DEBUG) console.log('Discarded as garbage:', text);
     return '';
   }
@@ -129,18 +127,16 @@ function cleanText(text) {
 async function translateMessage(text, detectedLang) {
   if (text.length > 1000) text = text.substring(0, 1000);
 
-  // Нормализация языка (с поддержкой вариаций)
   let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
-  if (sourceLang.startsWith('zh')) sourceLang = 'zh';  // Fallback для libretranslate
+  if (sourceLang.startsWith('zh')) sourceLang = 'zh';
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
-  // Принудительный source если известен из Intercom (не auto), для overrides багов API
   let apiSource = 'auto';
   if (sourceLang !== 'auto' && sourceLang !== 'zh') {
-    apiSource = sourceLang;  // Для zh используем auto? Нет, попробуем force 'zh' если zh-*
+    apiSource = sourceLang;
   }
   if (sourceLang === 'zh') {
-    apiSource = 'zh';  // Force для китайского, чтобы API не путал
+    apiSource = 'zh';  // Force для китайского
   }
 
   if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) {
@@ -159,61 +155,65 @@ async function translateMessage(text, detectedLang) {
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
+  // Try primary, then fallbacks
+  let translatedText, finalSource;
   try {
-    if (DEBUG) console.log(`Sending to translation API: text="${text}", source=${apiSource}, target=${TARGET_LANG}`);
-    
-    const response = await axiosInstance.post(TRANSLATE_API_URL, {
-      q: text,
-      source: apiSource,
-      target: TARGET_LANG,
-      format: 'text'
+    const result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
+    if (result) return cacheAndReturn(result.text, result.source);
+  } catch (e) { console.warn('Primary API failed, trying fallback'); }
+
+  try {
+    const result = await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL);
+    if (result) return cacheAndReturn(result.text, result.source);
+  } catch (e) { console.warn('Fallback1 API failed, trying MyMemory'); }
+
+  try {
+    const result = await translateWithMyMemory(text, apiSource);
+    if (result) return cacheAndReturn(result.text, result.source);
+  } catch (e) { console.error('All APIs failed'); }
+
+  return null;
+
+  async function translateWithAPI(q, source, url) {
+    if (DEBUG) console.log(`Sending to API ${url}: text="${q}", source=${source}`);
+    const response = await axiosInstance.post(url, {
+      q, source, target: TARGET_LANG, format: 'text'
     });
+    const respData = response.data;
+    if (DEBUG) console.log('API response:', JSON.stringify(respData, null, 2));
 
-    let translatedText = response.data.translatedText?.trim();
-    if (DEBUG) console.log('Translation API response:', JSON.stringify(response.data, null, 2));
+    let transText = respData.translatedText?.trim();
+    if (!transText || transText.length < 1 || transText === q.trim() || /menu-item|select/.test(transText)) return null;
 
-    if (!translatedText || translatedText.length < 3 || translatedText === text.trim() || 
-        /id=|menu-item|select|option/.test(translatedText)) {
-      if (DEBUG) console.log('Translation failed: No valid translation or garbage output');
-      return null;
-    }
+    const apiDetected = respData.detectedLanguage?.language;
+    const confidence = respData.detectedLanguage?.confidence || 100;
+    let detSource = source === 'auto' ? apiDetected : sourceLang;
 
-    const apiDetected = response.data.detectedLanguage?.language;
-    const confidence = response.data.detectedLanguage?.confidence || 0;
-    let finalSource = apiSource === 'auto' ? apiDetected : sourceLang;
+    if (sourceLang === 'zh' && confidence < 70) return null;
+    if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
 
-    // Дополнительная проверка: если force zh дал confidence < 70 или detected не  zh/ko/ja (азиатские путаются), retry с auto или skip
-    if (sourceLang === 'zh' && apiDetected !== 'zh' && confidence < 90) {
-      console.warn(`Low confidence for forced zh: detected ${apiDetected} (${confidence}%). Skipping or retry logic can be added.`);
-      return null;  // Или retry с auto ниже
-    }
+    return { text: transText, source: detSource };
+  }
 
-    // Если detected кажется неверным (например, ko для китайского текста), игнорируем если не matches expected
-    const expectedLangsForZH = ['zh', 'ja', 'ko'];  // Азиатские могут путаться, но если мусор - skip
-    if (sourceLang === 'zh' && !expectedLangsForZH.includes(apiDetected) && apiSource !== 'auto') {
-      if (DEBUG) console.log('Mismatch in expected Asian lang, skipping');
-      return null;
-    }
+  async function translateWithMyMemory(q, source) {
+    const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
+    const response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
+      params: { q, langpair: langPair }
+    });
+    const respData = response.data.responseData;
+    let transText = response.data.matches[0]?.translation?.trim();  // Берем лучший матч
+    if (!transText || transText === q.trim()) return null;
 
-    if (DEBUG) console.log('Final source language:', finalSource);
+    const detSource = respData.detectedLanguage || sourceLang;  // MyMemory не всегда детектит
+    if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
 
-    // Проверка несоответствия языка
-    if (detectedLang !== 'auto' && finalSource !== sourceLang && finalSource !== 'zh') {
-      console.warn(`Warning: Intercom language (${detectedLang}/${sourceLang}) differs from API detected language (${finalSource})`);
-      // Опционально: fallback to auto retry, но для простоты warn
-    }
+    return { text: transText, source: detSource };
+  }
 
-    if (finalSource === TARGET_LANG || SKIP_LANGS.includes(finalSource)) {
-      if (DEBUG) console.log('Skipping: Final source language matches target or skipped');
-      return null;
-    }
-
-    const translation = { text: translatedText, sourceLang: finalSource, targetLang: TARGET_LANG };
+  function cacheAndReturn(text, src) {
+    const translation = { text, sourceLang: src, targetLang: TARGET_LANG };
     TRANSLATION_CACHE.set(cacheKey, translation);
     return translation;
-  } catch (error) {
-    console.error('Translation error:', error.message);
-    return null;
   }
 }
 
