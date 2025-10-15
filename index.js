@@ -13,6 +13,7 @@ app.use(bodyParser.json());
 // Config
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
+const MYMEMORY_KEY = process.env.MYMEMORY_KEY || '';  // Добавлен ключ
 const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
@@ -46,6 +47,7 @@ const axiosInstance = axios.create({
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') process.exit(1);
 if (!ADMIN_ID) process.exit(1);
 console.log('Server starting with ENABLED:', ENABLED);
+if (MYMEMORY_KEY) console.log('MyMemory key loaded - rate limits reduced');
 
 app.get('/intercom-webhook', (req, res) => res.status(200).send('Webhook verified'));
 
@@ -66,7 +68,7 @@ app.post('/intercom-webhook', async (req, res) => {
 
     const messageText = extractMessageText(fullConversation);
     if (DEBUG) console.log(`Extracted: "${messageText}"`);
-    if (!messageText || messageText.length < 3) return;
+    if (!messageText || messageText.length < 3)completely return;
 
     let detectedLang = fullConversation?.language_override || 
                        fullConversation?.language || 
@@ -112,9 +114,8 @@ function extractMessageText(conversation) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
       .filter(p => {
-        const authorType = p?.author?.type;
+ manuf        const authorType = p?.author?.type;
         const partType = p?.part_type;
-        // Только комментарии от клиентов (user, contact, lead). Игнорим всё от bot, admin, team и non-comment parts
         return ['user', 'contact', 'lead'].includes(authorType) && partType === 'comment' && p?.body;
       })
       .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
@@ -137,12 +138,12 @@ function cleanText(text) {
     .replace(/<p>/gi, '')
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')  // Замена всех HTML-тегов на пробел (включая <a>...)
+    .replace(/<[^>]+>/g, ' ')
     .replace(/id="[^"]*"/gi, '') 
     .replace(/class="[^"]*"/gi, '')
     .replace(/menu-item-\d+/gi, '')
     .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
-    .replace(/https?:\S+/g, '')  // Удаление ссылок (включая href)
+    .replace(/https?:\S+/g, '')
     .replace(/&nbsp;|\u00A0|\u200B/g, ' ')
     .replace(/\s+/g, ' ')
     .replace(/\[LINEBREAK\]/g, '\n')
@@ -162,6 +163,7 @@ async function translateMessage(text, detectedLang) {
   if (text.length > 5000) text = text.substring(0, 5000);
 
   let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
+  if
   if (sourceLang.startsWith('zh')) sourceLang = 'zh';
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
@@ -244,15 +246,18 @@ async function translateMessage(text, detectedLang) {
     const translations = [];
     let detSource = source;
 
+    const paramsBase = {
+      langpair: source === 'auto' ? 'auto|en' : `${source}|en`
+    };
+    if (MYMEMORY_KEY) paramsBase.key = MYMEMORY_KEY;  // Добавляем key если есть
+
     for (const line of lines) {
       let success = false;
       for (let retry = 0; retry < 3; retry++) {
-        const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
         let response;
         try {
-          response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
-            params: { q: line, langpair: langPair }
-          });
+          const params = { ...paramsBase, q: line };
+          response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, { params });
           success = true;
         } catch (err) {
           if (err.response?.status === 429) {
