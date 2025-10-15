@@ -4,7 +4,7 @@ import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
-import francAll from 'franc-all';  // Добавляем franc для fallback детекции языка
+import { francAll } from 'franc-all';  // Исправил импорт: franc-all экспортирует named export
 
 dotenv.config();
 const app = express();
@@ -141,8 +141,20 @@ async function translateMessage(text, detectedLang) {
   // Fallback детекция с franc если auto и API может не справиться
   let apiSource = sourceLang;
   if (sourceLang === 'auto') {
-    const francCode = francAll(text, { minLength: 3, whitelist: Object.keys(LANG_MAP) });
-    apiSource = LANG_MAP[francCode] || 'auto';
+    let francCode = 'und';  // Default undefined
+    try {
+      francCode = francAll(text, { minLength: 3 });  // francAll возвращает ISO 639-3 код или 'und'
+    } catch (err) {
+      console.warn('Franc detection failed:', err.message);
+    }
+    // Маппинг ISO 639-3 к нашим (основные языки)
+    const francMap = {
+      'cmn': 'zh', 'yue': 'zh', 'zho': 'zh',  // Chinese variants
+      'eng': 'en', 'rus': 'ru', 'ukr': 'uk', 'spa': 'es', 'deu': 'de', 'fra': 'fr',
+      'ita': 'it', 'por': 'pt', 'pol': 'pl', 'ces': 'cs', 'nld': 'nl', 'tur': 'tr',
+      'ara': 'ar', 'kor': 'ko', 'jpn': 'ja'
+    };
+    apiSource = francMap[francCode] || LANG_MAP[francCode] || 'auto';
     if (DEBUG) console.log('Franc fallback detected:', francCode, '->', apiSource);
   }
   if (apiSource === 'zh-Hant' || apiSource === 'zh-Hans') apiSource = 'zh';
@@ -213,9 +225,15 @@ async function translateMessage(text, detectedLang) {
 
     for (const line of lines) {
       const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
-      const response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
-        params: { q: line, langpair: langPair }
-      });
+      let response;
+      try {
+        response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
+          params: { q: line, langpair: langPair }
+        });
+      } catch (err) {
+        console.warn('MyMemory request failed for line:', line, err.message);
+        continue;
+      }
       const respData = response.data.responseData;
       const match = response.data.matches[0]?.translation?.trim();
       if (!match || match === line.trim()) continue;
