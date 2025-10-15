@@ -61,7 +61,7 @@ app.post('/intercom-webhook', async (req, res) => {
     const conversationId = conversation?.id;
     if (!conversationId) return;
 
-    // Fetch minimal conversation data via API
+    // Fetch full conversation
     const fullConversation = await fetchMinimalConversation(conversationId);
     if (!fullConversation) return;
 
@@ -94,14 +94,10 @@ async function fetchMinimalConversation(conversationId) {
           Authorization: INTERCOM_TOKEN,
           Accept: 'application/json',
           'Intercom-Version': INTERCOM_API_VERSION
-        },
-        params: {
-          // Intercom не поддерживает fields, но возвращает всё равно минимальный объект
-          // Мы просто логируем и используем
         }
       }
     );
-    if (DEBUG) console.log('Fetched minimal conversation:', JSON.stringify(response.data, null, 2));
+    if (DEBUG) console.log('Fetched conversation:', JSON.stringify(response.data, null, 2));
     return response.data;
   } catch (error) {
     console.error('Error fetching conversation:', error.message);
@@ -116,13 +112,17 @@ function extractMessageText(conversation) {
   if (parts.length > 0) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
-      .filter(p => p?.author?.type === 'user' && p?.body)
+      .filter(p => {
+        const authorType = p?.author?.type;
+        // Строго только от user, contact, lead (клиенты). Игнорим bot, admin, team
+        return ['user', 'contact', 'lead'].includes(authorType) && p?.body;
+      })
       .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
     if (parts[0]) {
       rawBody = parts[0].body;
     }
   }
-  if (!rawBody && conversation?.source?.author?.type === 'user' && conversation.source.body) {
+  if (!rawBody && ['user', 'contact', 'lead'].includes(conversation?.source?.author?.type) && conversation.source.body) {
     rawBody = conversation.source.body;
   }
   if (DEBUG && rawBody) console.log('Raw body before clean:', rawBody);
