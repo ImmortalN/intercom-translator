@@ -26,7 +26,7 @@ const LANG_MAP = {
   'Polish': 'pl', 'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
   'Arabic': 'ar', 'Chinese': 'zh',
   // Дополнительные из Intercom (для китайского и вариаций)
-  'Chinese (Taiwan)': 'zh-Hant', 'Chinese (Simplified)': 'zh-Hans', 'Chinese (Traditional)': 'zh-Hant',
+  'Chinese (Taiwan)': 'zh-Hant', 'Chinese (Simplified)': 'zh-Hans', 'Chinese (Traditional)': 'zh-Hant', 'Traditional Chinese': 'zh-Hant',
   'ko': 'ko', 'ja': 'ja'  // Добавил корейский и японский на случай
 };
 const INTERCOM_API_VERSION = '2.11';
@@ -90,7 +90,7 @@ function extractMessageText(conversation) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
       .filter(p => p?.author?.type === 'user' && p?.body)
-      .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
+      .sort(( cleaning(a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
     if (parts[0]) {
       rawBody = parts[0].body;
     }
@@ -105,7 +105,7 @@ function extractMessageText(conversation) {
 function cleanText(text) {
   if (!text) return '';
   // Более агрессивная очистка: теги, атрибуты, скрипты, UI-артефакты
-  text = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')  // Удаляем скрипты
+  text = text.replace06(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')  // Удаляем скрипты
               .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
               .replace(/<[^>]+>/g, ' ')  // Теги на пробел
               .replace(/id="[^"]*"/gi, '') 
@@ -134,6 +134,15 @@ async function translateMessage(text, detectedLang) {
   if (sourceLang.startsWith('zh')) sourceLang = 'zh';  // Fallback для libretranslate
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
+  // Принудительный source если известен из Intercom (не auto), для overrides багов API
+  let apiSource = 'auto';
+  if (sourceLang !== 'auto' && sourceLang !== 'zh') {
+    apiSource = sourceLang;  // Для zh используем auto? Нет, попробуем force 'zh' если zh-*
+  }
+  if (sourceLang === 'zh') {
+    apiSource = 'zh';  // Force для китайского, чтобы API не путал
+  }
+
   if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) {
     if (DEBUG) console.log('Skipping translation: Language is undefined or in SKIP_LANGS');
     return null;
@@ -151,7 +160,6 @@ async function translateMessage(text, detectedLang) {
   }
 
   try {
-    const apiSource = sourceLang;
     if (DEBUG) console.log(`Sending to translation API: text="${text}", source=${apiSource}, target=${TARGET_LANG}`);
     
     const response = await axiosInstance.post(TRANSLATE_API_URL, {
@@ -170,12 +178,29 @@ async function translateMessage(text, detectedLang) {
       return null;
     }
 
-    const finalSource = apiSource === 'auto' ? (response.data.detectedLanguage?.language || sourceLang) : sourceLang;
+    const apiDetected = response.data.detectedLanguage?.language;
+    const confidence = response.data.detectedLanguage?.confidence || 0;
+    let finalSource = apiSource === 'auto' ? apiDetected : sourceLang;
+
+    // Дополнительная проверка: если force zh дал confidence < 70 или detected не  zh/ko/ja (азиатские путаются), retry с auto или skip
+    if (sourceLang === 'zh' && apiDetected !== 'zh' && confidence < 90) {
+      console.warn(`Low confidence for forced zh: detected ${apiDetected} (${confidence}%. Skipping or retry logic can be added.`);
+      return null;  // Или retry с auto ниже
+    }
+
+    // Если detected кажется неверным (например, ko для китайского текста), игнорируем если не matches expected
+    const expectedLangsForZH = ['zh', 'ja', 'ko'];  // Азиатские могут путаться, но если мусор - skip
+    if (sourceLang === 'zh' && !expectedLangsForZH.includes(apiDetected) && apiSource !== 'auto') {
+      if (DEBUG) console.log('Mismatch in expected Asian lang, skipping');
+      return null;
+    }
+
     if (DEBUG) console.log('Final source language:', finalSource);
 
     // Проверка несоответствия языка
     if (detectedLang !== 'auto' && finalSource !== sourceLang && finalSource !== 'zh') {
       console.warn(`Warning: Intercom language (${detectedLang}/${sourceLang}) differs from API detected language (${finalSource})`);
+      // Опционально: fallback to auto retry, но для простоты warn
     }
 
     if (finalSource === TARGET_LANG || SKIP_LANGS.includes(finalSource)) {
@@ -194,7 +219,7 @@ async function translateMessage(text, detectedLang) {
 
 async function createInternalNote(conversationId, translation) {
   try {
-    const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
+    const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}):, translation.text}`;
     await axiosInstance.post(
       `https://api.intercom.io/conversations/${conversationId}/reply`,
       { message_type: 'note', admin_id: ADMIN_ID, body: noteBody },
@@ -208,7 +233,7 @@ async function createInternalNote(conversationId, translation) {
       }
     );
     if (DEBUG) console.log('Internal note created successfully');
-  } catch (error) {
+  } with (error) {
     console.error('Note error:', error.message);
     if (error.response) console.error('Note error response:', error.response.data);
   }
@@ -216,3 +241,4 @@ async function createInternalNote(conversationId, translation) {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
+}
