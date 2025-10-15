@@ -16,26 +16,29 @@ const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const LANG_MAP = {
-  // ISO 639-1 коды
   'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'cs': 'cs', 'nl': 'nl', 'tr': 'tr',
-  'ar': 'ar', 'zh': 'zh', 'zh-Hant': 'zh', 'zh-Hans': 'zh',  // Поддержка китайских вариантов (libretranslate использует 'zh')
-  // Названия языков из Intercom
+  'ar': 'ar', 'zh': 'zh', 'zh-Hant': 'zh', 'zh-Hans': 'zh',
   'English': 'en', 'Russian': 'ru', 'Ukrainian': 'uk', 'Spanish': 'es',
   'German': 'de', 'French': 'fr', 'Italian': 'it', 'Portuguese': 'pt',
   'Polish': 'pl', 'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
   'Arabic': 'ar', 'Chinese': 'zh',
-  // Дополнительные из Intercom (для китайского и вариаций)
   'Chinese (Taiwan)': 'zh-Hant', 'Chinese (Simplified)': 'zh-Hans', 'Chinese (Traditional)': 'zh-Hant', 'Traditional Chinese': 'zh-Hant',
-  'ko': 'ko', 'ja': 'ja'  // Добавил корейский и японский на случай
+  'ko': 'ko', 'ja': 'ja'
 };
 const INTERCOM_API_VERSION = '2.11';
-const PRIMARY_TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';  // Primary: libretranslate
-const FALLBACK_TRANSLATE_API_URL = 'https://libretranslate.com/translate';  // Fallback: официальный libretranslate
-const FALLBACK2_TRANSLATE_API_URL = 'https://libretranslate.de/translate';  // Additional fallback: другой instance (более стабильный для zh)
-const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';  // Additional fallback: MyMemory
+
+// Полностью бесплатные API (без ключей и лимитов на ключи, только публичные instances/rate limits)
+const LIBRE_INSTANCES = [  // Несколько instances LibreTranslate (Argos) - бесплатные, open-source, если один down - следующий
+  'https://libretranslate.de/translate',  // Стабильный для zh, europe
+  'https://libretranslate.com/translate',  // Официальный
+  'https://translate.fedilab.app/translate',  // Fedilab instance
+  'https://translate.argosopentech.com/translate',  // Argos main
+  'https://libretranslate.cf/translate'  // Community fallback
+];
+const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';  // Бесплатно без key (low rate ~5000 слов/day, но для вашего объема хватит)
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
-const REQUEST_TIMEOUT = 8000;  // Увеличил таймаут для fallback
+const REQUEST_TIMEOUT = 8000;
 const DEBUG = process.env.DEBUG === 'true';
 
 const axiosInstance = axios.create({
@@ -47,6 +50,7 @@ const axiosInstance = axios.create({
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') process.exit(1);
 if (!ADMIN_ID) process.exit(1);
 console.log('Server starting with ENABLED:', ENABLED);
+console.log(`Using ${LIBRE_INSTANCES.length} LibreTranslate instances for redundancy`);
 
 app.get('/intercom-webhook', (req, res) => res.status(200).send('Webhook verified'));
 
@@ -107,6 +111,7 @@ function cleanText(text) {
   if (!text) return '';
   text = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
               .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
+              .replace(/<br\s*\/?>/gi, '\n')  // Сохраняем переносы для многострочных текстов
               .replace(/<[^>]+>/g, ' ')
               .replace(/id="[^"]*"/gi, '') 
               .replace(/class="[^"]*"/gi, '')
@@ -131,7 +136,6 @@ async function translateMessage(text, detectedLang) {
   if (sourceLang.startsWith('zh')) sourceLang = 'zh';
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
-  // Для zh всегда force 'zh', но в API source='zh' (libretranslate поддерживает)
   let apiSource = sourceLang === 'zh' ? 'zh' : (sourceLang !== 'auto' ? sourceLang : 'auto');
 
   if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) {
@@ -150,19 +154,21 @@ async function translateMessage(text, detectedLang) {
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
-  // Try APIs in sequence
   let result;
+
+  // Для zh: force 'zh' и приоритет instances хорошие для азиатских
   if (sourceLang === 'zh') {
-    // Для zh: force source='zh' в primary и fallbacks
-    result = await translateWithAPI(text, 'zh', PRIMARY_TRANSLATE_API_URL) ||
-             await translateWithAPI(text, 'zh', FALLBACK_TRANSLATE_API_URL) ||
-             await translateWithAPI(text, 'zh', FALLBACK2_TRANSLATE_API_URL) ||
-             await translateWithMyMemory(text, 'zh');
+    for (const url of LIBRE_INSTANCES) {
+      result = await translateWithLibre(text, 'zh', url);
+      if (result) break;
+    }
+    if (!result) result = await translateWithMyMemory(text, 'zh');
   } else {
-    result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL) ||
-             await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL) ||
-             await translateWithAPI(text, apiSource, FALLBACK2_TRANSLATE_API_URL) ||
-             await translateWithMyMemory(text, apiSource);
+    for (const url of LIBRE_INSTANCES) {
+      result = await translateWithLibre(text, apiSource, url);
+      if (result) break;
+    }
+    if (!result) result = await translateWithMyMemory(text, apiSource);
   }
 
   if (!result) return null;
@@ -172,17 +178,17 @@ async function translateMessage(text, detectedLang) {
   return translation;
 }
 
-async function translateWithAPI(q, source, url) {
-  if (DEBUG) console.log(`Sending to API ${url}: text="${q}", source=${source}`);
+async function translateWithLibre(q, source, url) {
+  if (DEBUG) console.log(`Trying Libre instance ${url}: text="${q}", source=${source}`);
   try {
     const response = await axiosInstance.post(url, {
       q, source, target: TARGET_LANG, format: 'text'
     });
     const respData = response.data;
-    if (DEBUG) console.log('API response:', JSON.stringify(respData, null, 2));
+    if (DEBUG) console.log('Libre response:', JSON.stringify(respData, null, 2));
 
     let transText = respData.translatedText?.trim();
-    if (!transText || transText.length < 1 || /menu-item|select|id=/.test(transText)) return null;  // Фильтр garbage как в логах
+    if (!transText || transText.length < 1 || /menu-item|select|id=/.test(transText)) return null;
 
     const apiDetected = respData.detectedLanguage?.language || source;
     const confidence = respData.detectedLanguage?.confidence || 100;
@@ -190,15 +196,21 @@ async function translateWithAPI(q, source, url) {
     if (confidence < 70) return null;
     if (apiDetected === TARGET_LANG || SKIP_LANGS.includes(apiDetected)) return null;
 
+    // Проверка на полный перевод: если оригинал имеет \n или >50 chars, а перевод короче 50% - skip to next
+    if (q.includes('\n') && !transText.includes(' ') && transText.length < q.length / 2) {
+      if (DEBUG) console.log('Incomplete translation detected, skipping instance');
+      return null;
+    }
+
     return { text: transText, source: apiDetected };
   } catch (e) {
-    console.warn(`API ${url} failed: ${e.message}`);
+    console.warn(`Libre ${url} failed: ${e.message} - switching to next`);
     return null;
   }
 }
 
 async function translateWithMyMemory(q, source) {
-  if (DEBUG) console.log(`Sending to MyMemory: text="${q}", source=${source}`);
+  if (DEBUG) console.log(`Trying MyMemory: text="${q}", source=${source}`);
   try {
     const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
     const response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
@@ -207,6 +219,9 @@ async function translateWithMyMemory(q, source) {
     const respData = response.data.responseData;
     const transText = response.data.matches[0]?.translation?.trim();
     if (!transText || transText.length < 1 || /menu-item|select/.test(transText)) return null;
+
+    // Аналогичная проверка на полноту
+    if (q.includes('\n') && transText.length < q.length / 2) return null;
 
     const detSource = respData.detectedLanguage || source;
     if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
