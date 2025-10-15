@@ -4,7 +4,7 @@ import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
-import { francAll } from 'franc-all';  // Исправил импорт: franc-all экспортирует named export
+import { francAll } from 'franc-all';  // Исправленный импорт
 
 dotenv.config();
 const app = express();
@@ -109,17 +109,17 @@ function cleanText(text) {
   if (!text) return '';
   text = text
     .replace(/<br\s*\/?>/gi, '\n')  // Сохраняем <br> как перенос строки
-    .replace(/<p>/gi, '\n').replace(/<\/p>/gi, '\n')  // Обрабатываем параграфы
+    .replace(/<p>/gi, '\n').replace(/<\/p>/gi, '')  // Обрабатываем <p> как начало новой строки, закрывающий на пусто
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')  // Остальные теги на пробел
     .replace(/id="[^"]*"/gi, '') 
     .replace(/class="[^"]*"/gi, '')
     .replace(/menu-item-\d+/gi, '')
-    .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
+    .replace(/license9 key[:\s]*[a-f0-9]{32}/gi, '')
     .replace(/https?:\S+/g, '')  // Убрал http(s) ссылки
     .replace(/&nbsp;|\u00A0|\u200B/g, ' ')
-    .replace(/\s+/g, ' ')  // Сжимаем пробелы, но \n остаются
+    .replace(/\s+/g, ' ')  // Сжимаем пробелы, но \n остаются (поскольку \n не whitespace в регексе \s)
     .trim();
 
   // Ослабленный фильтр мусора: только для коротких текстов с UI-словами
@@ -132,24 +132,23 @@ function cleanText(text) {
 }
 
 async function translateMessage(text, detectedLang) {
-  if (text.length > 2000) text = text.substring(0, 2000);  // Увеличил лимит, чтобы реже обрезать
+  if (text.length > 5000) text = text.substring(0, 5000);  // Увеличил лимит до 5000 (LibreTranslate handles больше)
 
   let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
   if (sourceLang.startsWith('zh')) sourceLang = 'zh';
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
-  // Fallback детекция с franc если auto и API может не справиться
+  // Fallback детекция с franc если auto
   let apiSource = sourceLang;
   if (sourceLang === 'auto') {
-    let francCode = 'und';  // Default undefined
+    let francCode = 'und';  
     try {
-      francCode = francAll(text, { minLength: 3 });  // francAll возвращает ISO 639-3 код или 'und'
+      francCode = francAll(text, { minLength: 3 });  
     } catch (err) {
       console.warn('Franc detection failed:', err.message);
     }
-    // Маппинг ISO 639-3 к нашим (основные языки)
     const francMap = {
-      'cmn': 'zh', 'yue': 'zh', 'zho': 'zh',  // Chinese variants
+      'cmn': 'zh', 'yue': 'zh', 'zho': 'zh',  
       'eng': 'en', 'rus': 'ru', 'ukr': 'uk', 'spa': 'es', 'deu': 'de', 'fra': 'fr',
       'ita': 'it', 'por': 'pt', 'pol': 'pl', 'ces': 'cs', 'nld': 'nl', 'tur': 'tr',
       'ara': 'ar', 'kor': 'ko', 'jpn': 'ja'
@@ -204,39 +203,38 @@ async function translateMessage(text, detectedLang) {
 
     let transText = respData.translatedText?.trim();
     if (!transText || transText.length < 1 || transText === q.trim()) return null;
-    // Убрал жёсткий фильтр на 'select' etc., чтобы не отбрасывать валидные переводы
-    // Если нужно, добавьте мягкую проверку: if (/menu-item|dropdown-ui/.test(transText.toLowerCase())) return null;
 
     const apiDetected = respData.detectedLanguage?.language || source;
     const confidence = respData.detectedLanguage?.confidence || 100;
     let detSource = source === 'auto' ? apiDetected : source;
 
-    if (confidence < 50) return null;  // Пониженный порог уверенности
+    if (confidence < 50) return null;  
     if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
 
     return { text: transText, source: detSource };
   }
 
   async function translateWithMyMemory(q, source) {
-    // Поддержка многострочки: переводим по частям если \n
-    const lines = q.split('\n').map(line => line.trim()).filter(line => line.length > 0);
+    // Делим на предложения по \n или .!? для лучшей обработки длинных текстов
+    const sentences = q.split(/(\n|\.|\?|\!)/g).map(s => s.trim()).filter(s => s.length > 0 && !/[\.\?\!]$/.test(s) || s.length > 5); // Фильтр пустых
     const translations = [];
     let detSource = source;
 
-    for (const line of lines) {
+    for (let i = 0; i < sentences.length; i += 2) {  // Группируем по 2 предложения, чтобы не потерять контекст
+      const chunk = sentences.slice(i, i + 2).join(' ');
       const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
       let response;
       try {
         response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
-          params: { q: line, langpair: langPair }
+          params: { q: chunk, langpair: langPair }
         });
       } catch (err) {
-        console.warn('MyMemory request failed for line:', line, err.message);
+        console.warn('MyMemory request failed for chunk:', chunk, err.message);
         continue;
       }
       const respData = response.data.responseData;
       const match = response.data.matches[0]?.translation?.trim();
-      if (!match || match === line.trim()) continue;
+      if (!match || match === chunk.trim()) continue;
 
       translations.push(match);
       if (!detSource || detSource === 'auto') {
@@ -245,7 +243,7 @@ async function translateMessage(text, detectedLang) {
     }
 
     if (translations.length === 0) return null;
-    const transText = translations.join('\n');
+    const transText = translations.join(' ');  // Джойним пробелом или \n если нужно
 
     if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
 
@@ -261,7 +259,7 @@ async function translateMessage(text, detectedLang) {
 
 async function createInternalNote(conversationId, translation) {
   try {
-    const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
+    const noteBody = `Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
     await axiosInstance.post(
       `https://api.intercom.io/conversations/${conversationId}/reply`,
       { message_type: 'note', admin_id: ADMIN_ID, body: noteBody },
