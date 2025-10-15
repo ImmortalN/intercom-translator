@@ -4,7 +4,7 @@ import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
-import { francAll } from 'franc-all';  // Исправленный импорт
+import { francAll } from 'franc-all';
 
 dotenv.config();
 const app = express();
@@ -17,27 +17,23 @@ const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const LANG_MAP = {
-  // ISO 639-1 коды
   'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'cs': 'cs', 'nl': 'nl', 'tr': 'tr',
-  'ar': 'ar', 'zh': 'zh', 'zh-Hant': 'zh', 'zh-Hans': 'zh',  // Поддержка китайских вариантов
-  // Названия языков из Intercom
+  'ar': 'ar', 'zh': 'zh', 'zh-Hant': 'zh', 'zh-Hans': 'zh',
   'English': 'en', 'Russian': 'ru', 'Ukrainian': 'uk', 'Spanish': 'es',
   'German': 'de', 'French': 'fr', 'Italian': 'it', 'Portuguese': 'pt',
   'Polish': 'pl', 'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
   'Arabic': 'ar', 'Chinese': 'zh',
-  // Дополнительные из Intercom (для китайского и вариаций)
   'Chinese (Taiwan)': 'zh-Hant', 'Chinese (Simplified)': 'zh-Hans', 'Chinese (Traditional)': 'zh-Hant', 'Traditional Chinese': 'zh-Hant',
-  'ko': 'ko', 'ja': 'ja',  // Добавил корейский и японский
-  // Дополнительные варианты
+  'ko': 'ko', 'ja': 'ja',
   'zh-TW': 'zh', 'zh-CN': 'zh'
 };
 const INTERCOM_API_VERSION = '2.11';
-const PRIMARY_TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';  // Primary: libretranslate
-const FALLBACK_TRANSLATE_API_URL = 'https://libretranslate.com/translate';  // Fallback: официальный libretranslate
-const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';  // Additional fallback: MyMemory
+const PRIMARY_TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
+const FALLBACK_TRANSLATE_API_URL = 'https://libretranslate.com/translate';
+const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
-const REQUEST_TIMEOUT = 10000;  // Увеличил таймаут для стабильности
+const REQUEST_TIMEOUT = 10000;
 const DEBUG = process.env.DEBUG === 'true';
 
 const axiosInstance = axios.create({
@@ -107,22 +103,27 @@ function extractMessageText(conversation) {
 
 function cleanText(text) {
   if (!text) return '';
+  // Сначала заменяем <br> и <p> на разделители, чтобы сохранить структуру
   text = text
-    .replace(/<br\s*\/?>/gi, '\n')  // Сохраняем <br> как перенос строки
-    .replace(/<p>/gi, '\n').replace(/<\/p>/gi, '')  // Обрабатываем <p> как начало новой строки, закрывающий на пусто
+    .replace(/<br\s*\/?>/gi, '\n')  // <br> на новую строку
+    .replace(/<\/p>/gi, '\n')  // </p> на новую строку
+    .replace(/<p>/gi, '')  // <p> убираем, чтобы не дублировать
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')  // Остальные теги на пробел
     .replace(/id="[^"]*"/gi, '') 
     .replace(/class="[^"]*"/gi, '')
     .replace(/menu-item-\d+/gi, '')
-    .replace(/license9 key[:\s]*[a-f0-9]{32}/gi, '')
-    .replace(/https?:\S+/g, '')  // Убрал http(s) ссылки
+    .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
+    .replace(/https?:\S+/g, '')
     .replace(/&nbsp;|\u00A0|\u200B/g, ' ')
-    .replace(/\s+/g, ' ')  // Сжимаем пробелы, но \n остаются (поскольку \n не whitespace в регексе \s)
+    .replace(/[\r\n]+/g, '\n')  // Нормализуем переносы
+    .replace(/\s+/g, ' ')  // Сжимаем пробелы, но \n остаются
     .trim();
 
-  // Ослабленный фильтр мусора: только для коротких текстов с UI-словами
+  // Убираем пустые строки, но сохраняем структуру
+  text = text.split('\n').map(line => line.trim()).filter(line => line.length > 0).join('\n');
+
   const lowerText = text.toLowerCase();
   if ((/[a-zA-Z]="[^"]*"/.test(text) || /menu|select|option|dropdown/.test(lowerText)) && text.length < 50) {
     if (DEBUG) console.log('Discarded as garbage:', text);
@@ -132,13 +133,12 @@ function cleanText(text) {
 }
 
 async function translateMessage(text, detectedLang) {
-  if (text.length > 5000) text = text.substring(0, 5000);  // Увеличил лимит до 5000 (LibreTranslate handles больше)
+  if (text.length > 5000) text = text.substring(0, 5000);
 
   let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
   if (sourceLang.startsWith('zh')) sourceLang = 'zh';
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
-  // Fallback детекция с franc если auto
   let apiSource = sourceLang;
   if (sourceLang === 'auto') {
     let francCode = 'und';  
@@ -174,8 +174,13 @@ async function translateMessage(text, detectedLang) {
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
-  // Try primary, then fallbacks
-  let translatedText, finalSource;
+  // Попробуем MyMemory первым для лучшей обработки многострочных и китайского
+  try {
+    const result = await translateWithMyMemory(text, apiSource);
+    if (result) return cacheAndReturn(result.text, result.source);
+  } catch (e) { console.warn('MyMemory failed first, trying Libre', e.message); }
+
+  // Затем primary Libre
   try {
     const result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
     if (result) return cacheAndReturn(result.text, result.source);
@@ -184,7 +189,7 @@ async function translateMessage(text, detectedLang) {
   try {
     const result = await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL);
     if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.warn('Fallback1 API failed, trying MyMemory', e.message); }
+  } catch (e) { console.warn('Fallback1 API failed, trying MyMemory again', e.message); }
 
   try {
     const result = await translateWithMyMemory(text, apiSource);
@@ -215,26 +220,31 @@ async function translateMessage(text, detectedLang) {
   }
 
   async function translateWithMyMemory(q, source) {
-    // Делим на предложения по \n или .!? для лучшей обработки длинных текстов
-    const sentences = q.split(/(\n|\.|\?|\!)/g).map(s => s.trim()).filter(s => s.length > 0 && !/[\.\?\!]$/.test(s) || s.length > 5); // Фильтр пустых
+    if (DEBUG) console.log('Translating with MyMemory, splitting into chunks');
+    // Разделяем на строки (предложения сохраняются в строках благодаря cleanText)
+    const lines = q.split('\n').map(line => line.trim()).filter(line => line.length > 0);
     const translations = [];
     let detSource = source;
 
-    for (let i = 0; i < sentences.length; i += 2) {  // Группируем по 2 предложения, чтобы не потерять контекст
-      const chunk = sentences.slice(i, i + 2).join(' ');
+    for (const line of lines) {
       const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
       let response;
       try {
         response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
-          params: { q: chunk, langpair: langPair }
+          params: { q: line, langpair: langPair }
         });
       } catch (err) {
-        console.warn('MyMemory request failed for chunk:', chunk, err.message);
+        if (err.response?.status === 429) {
+          console.warn('MyMemory rate limit, waiting 1s');
+          await new Promise(resolve => setTimeout(resolve, 1000)); // Простая задержка от 429
+          continue;
+        }
+        console.warn('MyMemory request failed for line:', line, err.message);
         continue;
       }
       const respData = response.data.responseData;
       const match = response.data.matches[0]?.translation?.trim();
-      if (!match || match === chunk.trim()) continue;
+      if (!match || match === line.trim()) continue;
 
       translations.push(match);
       if (!detSource || detSource === 'auto') {
@@ -243,7 +253,7 @@ async function translateMessage(text, detectedLang) {
     }
 
     if (translations.length === 0) return null;
-    const transText = translations.join(' ');  // Джойним пробелом или \n если нужно
+    const transText = translations.join('\n');  // Сохраняем структуру
 
     if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
 
