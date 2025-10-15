@@ -61,7 +61,6 @@ app.post('/intercom-webhook', async (req, res) => {
     const conversationId = conversation?.id;
     if (!conversationId) return;
 
-    // Fetch full conversation
     const fullConversation = await fetchMinimalConversation(conversationId);
     if (!fullConversation) return;
 
@@ -114,8 +113,9 @@ function extractMessageText(conversation) {
     parts = parts
       .filter(p => {
         const authorType = p?.author?.type;
-        // Строго только от user, contact, lead (клиенты). Игнорим bot, admin, team
-        return ['user', 'contact', 'lead'].includes(authorType) && p?.body;
+        const partType = p?.part_type;
+        // Только комментарии от клиентов (user, contact, lead). Игнорим всё от bot, admin, team и non-comment parts
+        return ['user', 'contact', 'lead'].includes(authorType) && partType === 'comment' && p?.body;
       })
       .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
     if (parts[0]) {
@@ -137,12 +137,12 @@ function cleanText(text) {
     .replace(/<p>/gi, '')
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
+    .replace(/<[^>]+>/g, ' ')  // Замена всех HTML-тегов на пробел (включая <a>...)
     .replace(/id="[^"]*"/gi, '') 
     .replace(/class="[^"]*"/gi, '')
     .replace(/menu-item-\d+/gi, '')
     .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
-    .replace(/https?:\S+/g, '')
+    .replace(/https?:\S+/g, '')  // Удаление ссылок (включая href)
     .replace(/&nbsp;|\u00A0|\u200B/g, ' ')
     .replace(/\s+/g, ' ')
     .replace(/\[LINEBREAK\]/g, '\n')
