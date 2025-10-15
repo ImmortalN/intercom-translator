@@ -103,11 +103,11 @@ function extractMessageText(conversation) {
 
 function cleanText(text) {
   if (!text) return '';
-  // Сначала заменяем <br> и <p> на разделители, чтобы сохранить структуру
+  // Добавляем явный разделитель для <br> и p, чтобы при сжатии пробелов сохранить разделение
   text = text
-    .replace(/<br\s*\/?>/gi, '\n')  // <br> на новую строку
-    .replace(/<\/p>/gi, '\n')  // </p> на новую строку
-    .replace(/<p>/gi, '')  // <p> убираем, чтобы не дублировать
+    .replace(/<br\s*\/?>/gi, ' [LINEBREAK] ')  // Специальный токен для <br>
+    .replace(/<\/p>/gi, ' [LINEBREAK] ')  // Для </p>
+    .replace(/<p>/gi, '')  // <p> убираем
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
     .replace(/<[^>]+>/g, ' ')  // Остальные теги на пробел
@@ -117,11 +117,10 @@ function cleanText(text) {
     .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
     .replace(/https?:\S+/g, '')
     .replace(/&nbsp;|\u00A0|\u200B/g, ' ')
-    .replace(/[\r\n]+/g, '\n')  // Нормализуем переносы
-    .replace(/\s+/g, ' ')  // Сжимаем пробелы, но \n остаются
+    .replace(/\s+/g, ' ')  // Сжимаем пробелы, токен [LINEBREAK] сохранится
+    .replace(/\[LINEBREAK\]/g, '\n')  // Восстанавливаем в \n
     .trim();
 
-  // Убираем пустые строки, но сохраняем структуру
   text = text.split('\n').map(line => line.trim()).filter(line => line.length > 0).join('\n');
 
   const lowerText = text.toLowerCase();
@@ -174,27 +173,23 @@ async function translateMessage(text, detectedLang) {
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
-  // Попробуем MyMemory первым для лучшей обработки многострочных и китайского
-  try {
-    const result = await translateWithMyMemory(text, apiSource);
-    if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.warn('MyMemory failed first, trying Libre', e.message); }
+  // Попробуем MyMemory первым
+  let result = await tryMyMemoryWithRetry(text, apiSource);
+  if (result) return cacheAndReturn(result.text, result.source);
 
-  // Затем primary Libre
+  // Затем Libre
   try {
-    const result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
+    result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
     if (result) return cacheAndReturn(result.text, result.source);
   } catch (e) { console.warn('Primary API failed, trying fallback', e.message); }
 
   try {
-    const result = await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL);
+    result = await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL);
     if (result) return cacheAndReturn(result.text, result.source);
   } catch (e) { console.warn('Fallback1 API failed, trying MyMemory again', e.message); }
 
-  try {
-    const result = await translateWithMyMemory(text, apiSource);
-    if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.error('All APIs failed', e.message); }
+  result = await tryMyMemoryWithRetry(text, apiSource);
+  if (result) return cacheAndReturn(result.text, result.source);
 
   return null;
 
@@ -219,41 +214,46 @@ async function translateMessage(text, detectedLang) {
     return { text: transText, source: detSource };
   }
 
-  async function translateWithMyMemory(q, source) {
-    if (DEBUG) console.log('Translating with MyMemory, splitting into chunks');
-    // Разделяем на строки (предложения сохраняются в строках благодаря cleanText)
+  async function tryMyMemoryWithRetry(q, source) {
     const lines = q.split('\n').map(line => line.trim()).filter(line => line.length > 0);
     const translations = [];
     let detSource = source;
 
     for (const line of lines) {
-      const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
-      let response;
-      try {
-        response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
-          params: { q: line, langpair: langPair }
-        });
-      } catch (err) {
-        if (err.response?.status === 429) {
-          console.warn('MyMemory rate limit, waiting 1s');
-          await new Promise(resolve => setTimeout(resolve, 1000)); // Простая задержка от 429
-          continue;
+      let success = false;
+      for (let retry = 0; retry < 3; retry++) {  // Retry up to 3 times
+        const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
+        let response;
+        try {
+          response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
+            params: { q: line, langpair: langPair }
+          });
+          success = true;
+        } catch (err) {
+          if (err.response?.status === 429) {
+            const wait = 2000 * (retry + 1);  // Exponential backoff
+            console.warn(`MyMemory rate limit, waiting ${wait}ms and retry ${retry + 1}`);
+            await new Promise(resolve => setTimeout(resolve, wait));
+            continue;
+          }
+          console.warn('MyMemory request failed for line:', line, err.message);
+          break;
         }
-        console.warn('MyMemory request failed for line:', line, err.message);
-        continue;
-      }
-      const respData = response.data.responseData;
-      const match = response.data.matches[0]?.translation?.trim();
-      if (!match || match === line.trim()) continue;
+        const respData = response.data.responseData;
+        const match = response.data.matches[0]?.translation?.trim();
+        if (!match || match === line.trim()) break;
 
-      translations.push(match);
-      if (!detSource || detSource === 'auto') {
-        detSource = respData.detectedLanguage || source;
+        translations.push(match);
+        if (!detSource || detSource === 'auto') {
+          detSource = respData.detectedLanguage || source;
+        }
+        break;  // Success, exit retry
       }
+      if (!success) continue;
     }
 
     if (translations.length === 0) return null;
-    const transText = translations.join('\n');  // Сохраняем структуру
+    const transText = translations.join('\n');
 
     if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
 
