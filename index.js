@@ -90,7 +90,7 @@ function extractMessageText(conversation) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
       .filter(p => p?.author?.type === 'user' && p?.body)
-      .sort(( cleaning(a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
+      .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
     if (parts[0]) {
       rawBody = parts[0].body;
     }
@@ -105,7 +105,7 @@ function extractMessageText(conversation) {
 function cleanText(text) {
   if (!text) return '';
   // Более агрессивная очистка: теги, атрибуты, скрипты, UI-артефакты
-  text = text.replace06(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')  // Удаляем скрипты
+  text = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')  // Удаляем скрипты
               .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
               .replace(/<[^>]+>/g, ' ')  // Теги на пробел
               .replace(/id="[^"]*"/gi, '') 
@@ -184,7 +184,7 @@ async function translateMessage(text, detectedLang) {
 
     // Дополнительная проверка: если force zh дал confidence < 70 или detected не  zh/ko/ja (азиатские путаются), retry с auto или skip
     if (sourceLang === 'zh' && apiDetected !== 'zh' && confidence < 90) {
-      console.warn(`Low confidence for forced zh: detected ${apiDetected} (${confidence}%. Skipping or retry logic can be added.`);
+      console.warn(`Low confidence for forced zh: detected ${apiDetected} (${confidence}%). Skipping or retry logic can be added.`);
       return null;  // Или retry с auto ниже
     }
 
@@ -219,7 +219,7 @@ async function translateMessage(text, detectedLang) {
 
 async function createInternalNote(conversationId, translation) {
   try {
-    const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}):, translation.text}`;
+    const noteBody = `📝 Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
     await axiosInstance.post(
       `https://api.intercom.io/conversations/${conversationId}/reply`,
       { message_type: 'note', admin_id: ADMIN_ID, body: noteBody },
@@ -233,7 +233,7 @@ async function createInternalNote(conversationId, translation) {
       }
     );
     if (DEBUG) console.log('Internal note created successfully');
-  } with (error) {
+  } catch (error) {
     console.error('Note error:', error.message);
     if (error.response) console.error('Note error response:', error.response.data);
   }
@@ -241,4 +241,3 @@ async function createInternalNote(conversationId, translation) {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Server on ${PORT}`));
-}
