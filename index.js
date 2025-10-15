@@ -66,7 +66,7 @@ app.post('/intercom-webhook', async (req, res) => {
     const fullConversation = await fetchMinimalConversation(conversationId);
     if (!fullConversation) return;
 
-    const messageText = extractMessageText(fullConversation);
+    const messageText = extractMessageText(fullConversation, topic);
     if (DEBUG) console.log(`Extracted: "${messageText}"`);
     if (!messageText || messageText.length < 3) return;
 
@@ -107,10 +107,15 @@ async function fetchMinimalConversation(conversationId) {
   }
 }
 
-function extractMessageText(conversation) {
-  let parts = conversation?.conversation_parts?.conversation_parts || [];
+function extractMessageText(conversation, webhookTopic) {
   let rawBody = '';
-  if (parts.length > 0) {
+  let parts = conversation?.conversation_parts?.conversation_parts || [];
+
+  // Для .user.created - берём source.body (первое сообщение клиента)
+  if (webhookTopic === 'conversation.user.created' && ['user', 'contact', 'lead'].includes(conversation?.source?.author?.type) && conversation.source.body) {
+    rawBody = conversation.source.body;
+    if (DEBUG) console.log('Using source.body for user.created');
+  } else if (parts.length > 0) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
       .filter(p => {
@@ -122,9 +127,6 @@ function extractMessageText(conversation) {
     if (parts[0]) {
       rawBody = parts[0].body;
     }
-  }
-  if (!rawBody && ['user', 'contact', 'lead'].includes(conversation?.source?.author?.type) && conversation.source.body) {
-    rawBody = conversation.source.body;
   }
   if (DEBUG && rawBody) console.log('Raw body before clean:', rawBody);
   return cleanText(rawBody);
@@ -201,21 +203,21 @@ async function translateMessage(text, detectedLang) {
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
+  // Сначала fedilab (быстрый и надёжный)
+  try {
+    const result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
+    if (result) return cacheAndReturn(result.text, result.source);
+  } catch (e) { console.warn('Primary API failed, trying MyMemory', e.message); }
+
+  // Затем MyMemory с ключом
   let result = await tryMyMemoryWithRetry(text, apiSource);
   if (result) return cacheAndReturn(result.text, result.source);
 
-  try {
-    result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
-    if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.warn('Primary API failed, trying fallback', e.message); }
-
+  // Libre как последний fallback
   try {
     result = await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL);
     if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.warn('Fallback1 API failed, trying MyMemory again', e.message); }
-
-  result = await tryMyMemoryWithRetry(text, apiSource);
-  if (result) return cacheAndReturn(result.text, result.source);
+  } catch (e) { console.warn('Fallback API failed', e.message); }
 
   return null;
 
@@ -248,7 +250,7 @@ async function translateMessage(text, detectedLang) {
     const paramsBase = {
       langpair: source === 'auto' ? 'auto|en' : `${source}|en`
     };
-    if (MYMEMORY_KEY) paramsBase.key = MYMEMORY_KEY;  // Добавляем key если есть
+    if (MYMEMORY_KEY) paramsBase.key = MYMEMORY_KEY;
 
     for (const line of lines) {
       let success = false;
