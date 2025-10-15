@@ -68,7 +68,7 @@ app.post('/intercom-webhook', async (req, res) => {
 
     const messageText = extractMessageText(fullConversation);
     if (DEBUG) console.log(`Extracted: "${messageText}"`);
-    if (!messageText || messageText.length < 3)completely return;
+    if (!messageText || messageText.length < 3) return;
 
     let detectedLang = fullConversation?.language_override || 
                        fullConversation?.language || 
@@ -114,7 +114,7 @@ function extractMessageText(conversation) {
     if (DEBUG) console.log('Parts count:', parts.length);
     parts = parts
       .filter(p => {
- manuf        const authorType = p?.author?.type;
+        const authorType = p?.author?.type;
         const partType = p?.part_type;
         return ['user', 'contact', 'lead'].includes(authorType) && partType === 'comment' && p?.body;
       })
@@ -163,7 +163,6 @@ async function translateMessage(text, detectedLang) {
   if (text.length > 5000) text = text.substring(0, 5000);
 
   let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
-  if
   if (sourceLang.startsWith('zh')) sourceLang = 'zh';
   if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
