@@ -4,6 +4,7 @@ import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
+import { franc } from 'franc';  // Добавили franc для локального детекта языка (npm install franc)
 
 dotenv.config();
 const app = express();
@@ -24,19 +25,25 @@ const LANG_MAP = {
   'Polish': 'pl', 'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
   'Arabic': 'ar', 'Chinese': 'zh',
   'Chinese (Taiwan)': 'zh-Hant', 'Chinese (Simplified)': 'zh-Hans', 'Chinese (Traditional)': 'zh-Hant', 'Traditional Chinese': 'zh-Hant',
-  'ko': 'ko', 'ja': 'ja'
+  'ko': 'ko', 'ja': 'ja',
+  // Добавили коды из franc (ISO 639-3): franc возвращает 3-буквенные, маппим на 2-буквенные где нужно
+  'cmn': 'zh', // Mandarin Chinese
+  'spa': 'es', 'deu': 'de', 'fra': 'fr', 'ita': 'it', 'por': 'pt', 'pol': 'pl', 'ces': 'cs', 'nld': 'nl', 'tur': 'tr',
+  'ara': 'ar', 'kor': 'ko', 'jpn': 'ja', 'rus': 'ru', 'ukr': 'uk', 'eng': 'en',
+  'und': 'auto' // undefined
 };
 const INTERCOM_API_VERSION = '2.11';
 
-// Полностью бесплатные API (без ключей и лимитов на ключи, только публичные instances/rate limits)
-const LIBRE_INSTANCES = [  // Несколько instances LibreTranslate (Argos) - бесплатные, open-source, если один down - следующий
-  'https://libretranslate.de/translate',  // Стабильный для zh, europe
-  'https://libretranslate.com/translate',  // Официальный
-  'https://translate.fedilab.app/translate',  // Fedilab instance
-  'https://translate.argosopentech.com/translate',  // Argos main
-  'https://libretranslate.cf/translate'  // Community fallback
+// Полностью бесплатные API
+const LIBRE_INSTANCES = [
+  'https://libretranslate.de/translate',
+  'https://libretranslate.com/translate',
+  'https://translate.fedilab.app/translate',
+  'https://translate.argosopentech.com/translate',
+  'https://libretranslate.cf/translate'
 ];
-const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';  // Бесплатно без key (low rate ~5000 слов/day, но для вашего объема хватит)
+const LINGVA_INSTANCE = 'https://lingva.ml/api/v1/auto/en/';  // Бесплатный open-source (self-hostable), авто-детект + перевод на en. Без key, публичный instance.
+const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
 const REQUEST_TIMEOUT = 8000;
 const DEBUG = process.env.DEBUG === 'true';
@@ -50,7 +57,7 @@ const axiosInstance = axios.create({
 if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') process.exit(1);
 if (!ADMIN_ID) process.exit(1);
 console.log('Server starting with ENABLED:', ENABLED);
-console.log(`Using ${LIBRE_INSTANCES.length} LibreTranslate instances for redundancy`);
+console.log(`Using ${LIBRE_INSTANCES.length} Libre instances + Lingva fallback`);
 
 app.get('/intercom-webhook', (req, res) => res.status(200).send('Webhook verified'));
 
@@ -72,12 +79,19 @@ app.post('/intercom-webhook', async (req, res) => {
 
     if (DEBUG) console.log('Conversation object:', JSON.stringify(conversation, null, 2));
 
-    let detectedLang = conversation?.language_override || 
+    let intercomLang = conversation?.language_override || 
                        conversation?.language || 
                        conversation?.custom_attributes?.Language || 
                        conversation?.source?.language || 
                        'auto';
-    if (DEBUG) console.log('Detected language from Intercom:', detectedLang);
+    if (DEBUG) console.log('Detected language from Intercom:', intercomLang);
+
+    // Умный детект: если Intercom 'auto' или und, или skip - используем franc на содержимом
+    let detectedLang = LANG_MAP[intercomLang] || 'auto';
+    if (detectedLang === 'auto' || detectedLang === 'und' || SKIP_LANGS.includes(detectedLang)) {
+      detectedLang = detectLangByContent(messageText, detectedLang);
+      if (DEBUG) console.log('Fallback content detection with franc:', detectedLang);
+    }
 
     const translation = await translateMessage(messageText, detectedLang);
     if (!translation) return;
@@ -87,6 +101,13 @@ app.post('/intercom-webhook', async (req, res) => {
     console.error('Webhook error:', error.message);
   }
 });
+
+function detectLangByContent(text, fallback = 'auto') {
+  if (!text || text.length < 10) return fallback;  // franc нуждается в минимальном тексте
+  const langCode = franc(text, { minLength: 3, whitelist: Object.keys(LANG_MAP) });  // Ограничиваем whitelist для скорости
+  if (langCode === 'und') return fallback;
+  return LANG_MAP[langCode] || fallback;
+}
 
 function extractMessageText(conversation) {
   let parts = conversation?.conversation_parts?.conversation_parts || [];
@@ -111,7 +132,7 @@ function cleanText(text) {
   if (!text) return '';
   text = text.replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
               .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-              .replace(/<br\s*\/?>/gi, '\n')  // Сохраняем переносы для многострочных текстов
+              .replace(/<br\s*\/?>/gi, '\n')
               .replace(/<[^>]+>/g, ' ')
               .replace(/id="[^"]*"/gi, '') 
               .replace(/class="[^"]*"/gi, '')
@@ -134,17 +155,17 @@ async function translateMessage(text, detectedLang) {
 
   let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
   if (sourceLang.startsWith('zh')) sourceLang = 'zh';
-  if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
+  if (DEBUG) console.log('Final source lang for API:', sourceLang);
 
   let apiSource = sourceLang === 'zh' ? 'zh' : (sourceLang !== 'auto' ? sourceLang : 'auto');
 
   if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) {
-    if (DEBUG) console.log('Skipping translation: Based on Intercom lang in SKIP_LANGS');
+    if (DEBUG) console.log('Skipping translation: lang in SKIP_LANGS or und');
     return null;
   }
 
   if (sourceLang === TARGET_LANG) {
-    if (DEBUG) console.log('Skipping translation: Source language matches target language');
+    if (DEBUG) console.log('Skipping translation: Source matches target');
     return null;
   }
 
@@ -156,19 +177,21 @@ async function translateMessage(text, detectedLang) {
 
   let result;
 
-  // Для zh: force 'zh' и приоритет instances хорошие для азиатских
+  // Параллельные запросы к Libre
   if (sourceLang === 'zh') {
-    for (const url of LIBRE_INSTANCES) {
-      result = await translateWithLibre(text, 'zh', url);
-      if (result) break;
-    }
-    if (!result) result = await translateWithMyMemory(text, 'zh');
+    result = await translateWithLibreAny(text, 'zh');
   } else {
-    for (const url of LIBRE_INSTANCES) {
-      result = await translateWithLibre(text, apiSource, url);
-      if (result) break;
-    }
-    if (!result) result = await translateWithMyMemory(text, apiSource);
+    result = await translateWithLibreAny(text, apiSource);
+  }
+
+  // Умный fallback: Lingva после Libre
+  if (!result) {
+    result = await translateWithLingva(text);
+  }
+
+  // Final MyMemory
+  if (!result) {
+    result = await translateWithMyMemory(text, apiSource);
   }
 
   if (!result) return null;
@@ -179,7 +202,7 @@ async function translateMessage(text, detectedLang) {
 }
 
 async function translateWithLibre(q, source, url) {
-  if (DEBUG) console.log(`Trying Libre instance ${url}: text="${q}", source=${source}`);
+  if (DEBUG) console.log(`Trying Libre ${url}: text="${q}", source=${source}`);
   try {
     const response = await axiosInstance.post(url, {
       q, source, target: TARGET_LANG, format: 'text'
@@ -196,15 +219,53 @@ async function translateWithLibre(q, source, url) {
     if (confidence < 70) return null;
     if (apiDetected === TARGET_LANG || SKIP_LANGS.includes(apiDetected)) return null;
 
-    // Проверка на полный перевод: если оригинал имеет \n или >50 chars, а перевод короче 50% - skip to next
-    if (q.includes('\n') && !transText.includes(' ') && transText.length < q.length / 2) {
-      if (DEBUG) console.log('Incomplete translation detected, skipping instance');
+    if (q.includes('\n') && transText.length < q.length / 2) {
+      if (DEBUG) console.log('Incomplete from Libre, skip');
       return null;
     }
 
     return { text: transText, source: apiDetected };
   } catch (e) {
-    console.warn(`Libre ${url} failed: ${e.message} - switching to next`);
+    if (e.response && e.response.status === 400) console.warn(`Libre ${url} bad request - likely HTML redirect or down`);
+    else console.warn(`Libre ${url} error: ${e.message}`);
+    return null;
+  }
+}
+
+async function translateWithLibreAny(q, source) {
+  const promises = LIBRE_INSTANCES.map(url => translateWithLibre(q, source, url));
+  const results = await Promise.allSettled(promises);
+  for (const res of results) {
+    if (res.status === 'fulfilled' && res.value) {
+      if (DEBUG) console.log('Successful Libre instance used');
+      return res.value;
+    }
+  }
+  if (DEBUG) console.log('All Libre instances failed');
+  return null;
+}
+
+async function translateWithLingva(q) {
+  const encodedQ = encodeURIComponent(q);
+  const url = `${LINGVA_INSTANCE}${encodedQ}`;
+  if (DEBUG) console.log(`Trying Lingva: ${url}`);
+  try {
+    const response = await axiosInstance.get(url);
+    const respData = response.data;
+    if (DEBUG) console.log('Lingva response:', JSON.stringify(respData, null, 2));
+
+    let transText = respData.translation?.trim();
+    if (!transText || transText.length < 1 || /menu-item|select/.test(transText)) return null;
+
+    // Lingva детектит auto, source в respData.detected
+    const apiDetected = respData.detected || 'auto';
+    if (apiDetected === TARGET_LANG || SKIP_LANGS.includes(apiDetected)) return null;
+
+    if (q.includes('\n') && transText.length < q.length / 2) return null;
+
+    return { text: transText, source: apiDetected };
+  } catch (e) {
+    console.warn(`Lingva failed: ${e.message}`);
     return null;
   }
 }
@@ -220,7 +281,6 @@ async function translateWithMyMemory(q, source) {
     const transText = response.data.matches[0]?.translation?.trim();
     if (!transText || transText.length < 1 || /menu-item|select/.test(transText)) return null;
 
-    // Аналогичная проверка на полноту
     if (q.includes('\n') && transText.length < q.length / 2) return null;
 
     const detSource = respData.detectedLanguage || source;
