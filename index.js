@@ -16,22 +16,26 @@ const ENABLED = process.env.ENABLED === 'true';
 const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const LANG_MAP = {
+  // ISO 639-1 коды
   'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'cs': 'cs', 'nl': 'nl', 'tr': 'tr',
-  'ar': 'ar', 'zh': 'zh', 'zh-Hant': 'zh', 'zh-Hans': 'zh',
+  'ar': 'ar', 'zh': 'zh', 'zh-Hant': 'zh', 'zh-Hans': 'zh',  // Поддержка китайских вариантов (libretranslate использует 'zh')
+  // Названия языков из Intercom
   'English': 'en', 'Russian': 'ru', 'Ukrainian': 'uk', 'Spanish': 'es',
   'German': 'de', 'French': 'fr', 'Italian': 'it', 'Portuguese': 'pt',
   'Polish': 'pl', 'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
   'Arabic': 'ar', 'Chinese': 'zh',
+  // Дополнительные из Intercom (для китайского и вариаций)
   'Chinese (Taiwan)': 'zh-Hant', 'Chinese (Simplified)': 'zh-Hans', 'Chinese (Traditional)': 'zh-Hant', 'Traditional Chinese': 'zh-Hant',
-  'ko': 'ko', 'ja': 'ja'
+  'ko': 'ko', 'ja': 'ja'  // Добавил корейский и японский на случай
 };
 const INTERCOM_API_VERSION = '2.11';
-const PRIMARY_TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
-const FALLBACK_TRANSLATE_API_URL = 'https://libretranslate.com/translate';
-const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';
+const PRIMARY_TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';  // Primary: libretranslate
+const FALLBACK_TRANSLATE_API_URL = 'https://libretranslate.com/translate';  // Fallback: официальный libretranslate
+const FALLBACK2_TRANSLATE_API_URL = 'https://libretranslate.de/translate';  // Additional fallback: другой instance (более стабильный для zh)
+const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';  // Additional fallback: MyMemory
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
-const REQUEST_TIMEOUT = 5000;
+const REQUEST_TIMEOUT = 8000;  // Увеличил таймаут для fallback
 const DEBUG = process.env.DEBUG === 'true';
 
 const axiosInstance = axios.create({
@@ -123,47 +127,54 @@ function cleanText(text) {
 async function translateMessage(text, detectedLang) {
   if (text.length > 1000) text = text.substring(0, 1000);
 
-  // Ключ: ВСЕГДА используем 'auto' для source в API, игнорируя Intercom detectedLang для source
-  // Потому что Intercom может ошибаться (как в вашем примере с "a Ok, voy a ello..." на Chinese), а API детект лучше справится с миксом.
-  // Только SKIP_LANGS проверяем если forced, но здесь auto.
-  const apiSource = 'auto';  // Фикс для мультиязыка и ошибок Intercom
-  let intercomSource = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
-  if (intercomSource.startsWith('zh')) intercomSource = 'zh';
+  let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
+  if (sourceLang.startsWith('zh')) sourceLang = 'zh';
+  if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
-  if (intercomSource === 'und' || SKIP_LANGS.includes(intercomSource)) {
+  // Для zh всегда force 'zh', но в API source='zh' (libretranslate поддерживает)
+  let apiSource = sourceLang === 'zh' ? 'zh' : (sourceLang !== 'auto' ? sourceLang : 'auto');
+
+  if (sourceLang === 'und' || SKIP_LANGS.includes(sourceLang)) {
     if (DEBUG) console.log('Skipping translation: Based on Intercom lang in SKIP_LANGS');
     return null;
   }
 
-  // Если Intercom говорит en/ru/uk, skip даже если текст микс (доверяем Intercom для skip, но переводим если API увидит другое? Нет, skip рано.
-  if (SKIP_LANGS.includes(intercomSource)) return null;
+  if (sourceLang === TARGET_LANG) {
+    if (DEBUG) console.log('Skipping translation: Source language matches target language');
+    return null;
+  }
 
-  const cacheKey = `${text}:${apiSource}:${TARGET_LANG}`;
+  const cacheKey = `${text}:${sourceLang}:${TARGET_LANG}`;
   if (TRANSLATION_CACHE.has(cacheKey)) {
     if (DEBUG) console.log('Returning cached translation');
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
-  let translatedText, finalSource;
+  // Try APIs in sequence
+  let result;
+  if (sourceLang === 'zh') {
+    // Для zh: force source='zh' в primary и fallbacks
+    result = await translateWithAPI(text, 'zh', PRIMARY_TRANSLATE_API_URL) ||
+             await translateWithAPI(text, 'zh', FALLBACK_TRANSLATE_API_URL) ||
+             await translateWithAPI(text, 'zh', FALLBACK2_TRANSLATE_API_URL) ||
+             await translateWithMyMemory(text, 'zh');
+  } else {
+    result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL) ||
+             await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL) ||
+             await translateWithAPI(text, apiSource, FALLBACK2_TRANSLATE_API_URL) ||
+             await translateWithMyMemory(text, apiSource);
+  }
+
+  if (!result) return null;
+
+  const translation = { text: result.text, sourceLang: result.source, targetLang: TARGET_LANG };
+  TRANSLATION_CACHE.set(cacheKey, translation);
+  return translation;
+}
+
+async function translateWithAPI(q, source, url) {
+  if (DEBUG) console.log(`Sending to API ${url}: text="${q}", source=${source}`);
   try {
-    const result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
-    if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.warn('Primary API failed, trying fallback'); }
-
-  try {
-    const result = await translateWithAPI(text, apiSource, FALLBACK_TRANSLATE_API_URL);
-    if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.warn('Fallback1 API failed, trying MyMemory'); }
-
-  try {
-    const result = await translateWithMyMemory(text, apiSource);
-    if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.error('All APIs failed'); }
-
-  return null;
-
-  async function translateWithAPI(q, source, url) {
-    if (DEBUG) console.log(`Sending to API ${url}: text="${q}", source=${source}`);
     const response = await axiosInstance.post(url, {
       q, source, target: TARGET_LANG, format: 'text'
     });
@@ -171,42 +182,39 @@ async function translateMessage(text, detectedLang) {
     if (DEBUG) console.log('API response:', JSON.stringify(respData, null, 2));
 
     let transText = respData.translatedText?.trim();
-    if (!transText || transText.length < 1 || /menu-item|select/.test(transText)) return null;
+    if (!transText || transText.length < 1 || /menu-item|select|id=/.test(transText)) return null;  // Фильтр garbage как в логах
 
-    const apiDetected = respData.detectedLanguage?.language || 'unknown';
-    let detSource = source === 'auto' ? apiDetected : intercomSource;
-
-    // Если translated почти равен original (для микс: если детект en но текст es, переведёт только es часть, но ок)
-    if (transText === q.trim() && detSource !== TARGET_LANG) return null;  // Только если не изменилось и не target
-
+    const apiDetected = respData.detectedLanguage?.language || source;
     const confidence = respData.detectedLanguage?.confidence || 100;
-    if (confidence < 50) return null;  // Низкая уверенность - skip
 
-    if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
+    if (confidence < 70) return null;
+    if (apiDetected === TARGET_LANG || SKIP_LANGS.includes(apiDetected)) return null;
 
-    return { text: transText, source: detSource };
+    return { text: transText, source: apiDetected };
+  } catch (e) {
+    console.warn(`API ${url} failed: ${e.message}`);
+    return null;
   }
+}
 
-  async function translateWithMyMemory(q, source) {
-    const langPair = `${source === 'auto' ? 'auto' : source}|en`;
+async function translateWithMyMemory(q, source) {
+  if (DEBUG) console.log(`Sending to MyMemory: text="${q}", source=${source}`);
+  try {
+    const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
     const response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
       params: { q, langpair: langPair }
     });
     const respData = response.data.responseData;
-    const matches = response.data.matches || [];
-    let transText = matches[0]?.translation?.trim();
-    if (!transText) return null;
+    const transText = response.data.matches[0]?.translation?.trim();
+    if (!transText || transText.length < 1 || /menu-item|select/.test(transText)) return null;
 
-    let detSource = respData.detectedLanguage || 'unknown';
+    const detSource = respData.detectedLanguage || source;
     if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
 
     return { text: transText, source: detSource };
-  }
-
-  function cacheAndReturn(text, src) {
-    const translation = { text, sourceLang: src, targetLang: TARGET_LANG };
-    TRANSLATION_CACHE.set(cacheKey, translation);
-    return translation;
+  } catch (e) {
+    console.warn(`MyMemory failed: ${e.message}`);
+    return null;
   }
 }
 
