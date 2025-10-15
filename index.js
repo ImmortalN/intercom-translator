@@ -29,6 +29,7 @@ const LANG_MAP = {
   'zh-TW': 'zh', 'zh-CN': 'zh'
 };
 const INTERCOM_API_VERSION = '2.11';
+const INTERCOM_API_BASE = 'https://api.intercom.io';
 const PRIMARY_TRANSLATE_API_URL = 'https://translate.fedilab.app/translate';
 const FALLBACK_TRANSLATE_API_URL = 'https://libretranslate.com/translate';
 const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';
@@ -60,16 +61,18 @@ app.post('/intercom-webhook', async (req, res) => {
     const conversationId = conversation?.id;
     if (!conversationId) return;
 
-    const messageText = extractMessageText(conversation);
+    // Fetch minimal conversation data via API
+    const fullConversation = await fetchMinimalConversation(conversationId);
+    if (!fullConversation) return;
+
+    const messageText = extractMessageText(fullConversation);
     if (DEBUG) console.log(`Extracted: "${messageText}"`);
     if (!messageText || messageText.length < 3) return;
 
-    if (DEBUG) console.log('Conversation object:', JSON.stringify(conversation, null, 2));
-
-    let detectedLang = conversation?.language_override || 
-                       conversation?.language || 
-                       conversation?.custom_attributes?.Language || 
-                       conversation?.source?.language || 
+    let detectedLang = fullConversation?.language_override || 
+                       fullConversation?.language || 
+                       fullConversation?.custom_attributes?.Language || 
+                       fullConversation?.source?.language || 
                        'auto';
     if (DEBUG) console.log('Detected language from Intercom:', detectedLang);
 
@@ -81,6 +84,31 @@ app.post('/intercom-webhook', async (req, res) => {
     console.error('Webhook error:', error.message);
   }
 });
+
+async function fetchMinimalConversation(conversationId) {
+  try {
+    const response = await axiosInstance.get(
+      `${INTERCOM_API_BASE}/conversations/${conversationId}`,
+      {
+        headers: {
+          Authorization: INTERCOM_TOKEN,
+          Accept: 'application/json',
+          'Intercom-Version': INTERCOM_API_VERSION
+        },
+        params: {
+          // Intercom не поддерживает fields, но возвращает всё равно минимальный объект
+          // Мы просто логируем и используем
+        }
+      }
+    );
+    if (DEBUG) console.log('Fetched minimal conversation:', JSON.stringify(response.data, null, 2));
+    return response.data;
+  } catch (error) {
+    console.error('Error fetching conversation:', error.message);
+    if (error.response) console.error('Fetch error response:', error.response.data);
+    return null;
+  }
+}
 
 function extractMessageText(conversation) {
   let parts = conversation?.conversation_parts?.conversation_parts || [];
@@ -103,22 +131,21 @@ function extractMessageText(conversation) {
 
 function cleanText(text) {
   if (!text) return '';
-  // Добавляем явный разделитель для <br> и p, чтобы при сжатии пробелов сохранить разделение
   text = text
-    .replace(/<br\s*\/?>/gi, ' [LINEBREAK] ')  // Специальный токен для <br>
-    .replace(/<\/p>/gi, ' [LINEBREAK] ')  // Для </p>
-    .replace(/<p>/gi, '')  // <p> убираем
+    .replace(/<br\s*\/?>/gi, ' [LINEBREAK] ')
+    .replace(/<\/p>/gi, ' [LINEBREAK] ')
+    .replace(/<p>/gi, '')
     .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
     .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')  // Остальные теги на пробел
+    .replace(/<[^>]+>/g, ' ')
     .replace(/id="[^"]*"/gi, '') 
     .replace(/class="[^"]*"/gi, '')
     .replace(/menu-item-\d+/gi, '')
     .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
     .replace(/https?:\S+/g, '')
     .replace(/&nbsp;|\u00A0|\u200B/g, ' ')
-    .replace(/\s+/g, ' ')  // Сжимаем пробелы, токен [LINEBREAK] сохранится
-    .replace(/\[LINEBREAK\]/g, '\n')  // Восстанавливаем в \n
+    .replace(/\s+/g, ' ')
+    .replace(/\[LINEBREAK\]/g, '\n')
     .trim();
 
   text = text.split('\n').map(line => line.trim()).filter(line => line.length > 0).join('\n');
@@ -173,11 +200,9 @@ async function translateMessage(text, detectedLang) {
     return TRANSLATION_CACHE.get(cacheKey);
   }
 
-  // Попробуем MyMemory первым
   let result = await tryMyMemoryWithRetry(text, apiSource);
   if (result) return cacheAndReturn(result.text, result.source);
 
-  // Затем Libre
   try {
     result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
     if (result) return cacheAndReturn(result.text, result.source);
@@ -221,7 +246,7 @@ async function translateMessage(text, detectedLang) {
 
     for (const line of lines) {
       let success = false;
-      for (let retry = 0; retry < 3; retry++) {  // Retry up to 3 times
+      for (let retry = 0; retry < 3; retry++) {
         const langPair = source === 'auto' ? 'auto|en' : `${source}|en`;
         let response;
         try {
@@ -231,7 +256,7 @@ async function translateMessage(text, detectedLang) {
           success = true;
         } catch (err) {
           if (err.response?.status === 429) {
-            const wait = 2000 * (retry + 1);  // Exponential backoff
+            const wait = 2000 * (retry + 1);
             console.warn(`MyMemory rate limit, waiting ${wait}ms and retry ${retry + 1}`);
             await new Promise(resolve => setTimeout(resolve, wait));
             continue;
@@ -247,7 +272,7 @@ async function translateMessage(text, detectedLang) {
         if (!detSource || detSource === 'auto') {
           detSource = respData.detectedLanguage || source;
         }
-        break;  // Success, exit retry
+        break;
       }
       if (!success) continue;
     }
@@ -271,7 +296,7 @@ async function createInternalNote(conversationId, translation) {
   try {
     const noteBody = `Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
     await axiosInstance.post(
-      `https://api.intercom.io/conversations/${conversationId}/reply`,
+      `${INTERCOM_API_BASE}/conversations/${conversationId}/reply`,
       { message_type: 'note', admin_id: ADMIN_ID, body: noteBody },
       {
         headers: {
