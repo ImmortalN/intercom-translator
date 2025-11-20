@@ -22,7 +22,7 @@ const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 
 // Порог: если меньше слов — не переводим (убирает 99% мусора)
-const MIN_WORDS_FOR_TRANSLATION = 5;
+const MIN_WORDS_FOR_TRANSLATION = 3;
 
 const INTERCOM_API_VERSION = '2.11';
 const INTERCOM_API_BASE = 'https://api.intercom.io';
