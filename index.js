@@ -11,107 +11,110 @@ dotenv.config();
 const app = express();
 app.use(bodyParser.json({ limit: '10mb' }));
 
-// ========================= CONFIG =========================
+// ======================== CONFIG ========================
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 const ENABLED = process.env.ENABLED === 'true';
-const TARGET_LANG = 'en';
-const SKIP_LANGS = new Set(['en', 'ru', 'uk']);
 const DEBUG = process.env.DEBUG === 'true';
 
-// Самые надёжные бесплатные инстансы (ноябрь 2025)
+// Самые живучие бесплатные инстансы (ноябрь 2025)
 const LIBRE_APIS = [
-  'https://libretranslate.de/translate',           // №1 по стабильности
+  'https://libretranslate.de/translate',
   'https://translate.argosopentech.com/translate',
   'https://translate.terraprint.co/translate'
 ];
 
 const CACHE = new NodeCache({ stdTTL: 48 * 3600, checkperiod: 3600 });
-const PROCESSED = new NodeCache({ stdTTL: 3600 });
+const PROCESSED = new NodeCache({ stdTTL: 3600 }); // антиспам дублей
 
 const axiosInstance = axios.create({
-  timeout: 7500,
+  timeout: 9000,
   httpAgent: new http.Agent({ keepAlive: true })
 });
 
-// ========================= УТИЛИТЫ =========================
+// ======================== УТИЛИТЫ ========================
 function cleanText(text = '') {
-  if (!text) return '';
   return text
     .replace(/<br\s*\/?>/gi, '\n')
     .replace(/<\/?[^>]+>/g, ' ')
-    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/https?:\/\/\S+/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
 
-function isObviouslyGarbage(text) {
-  if (!text) return true;
-  const lower = text.toLowerCase();
-  if (lower.includes('invalid source language')) return true;
-  if (lower.includes('auto')) return true;
-  if (lower.includes('@@')) return true;
-  if (lower.includes('mainstre')) return true;
-  if (/^['"]?auto['"]? is an invalid/i.test(lower)) return true;
-  if (text.length > 500 && text.split(' ').length < 10) return true; // повторяшки
+// Жёсткая, но точная защита от известного мусора
+function isGarbage(translated, original) {
+  if (!translated) return true;
+  const t = translated.toLowerCase();
+  if (t.includes('@@')) return true;
+  if (t.includes('mainstre')) return true;
+  if (t.includes('invalid source language')) return true;
+  if (t.includes('is an invalid')) return true;
+  if (translated.length > original.length * 6) return true;
+
+  // повтор одного слова >10 раз
+  const words = translated.split(/\s+/);
+  const count = {};
+  for (const w of words) {
+    if (w.length > 2) {
+      count[w] = (count[w] || 0) + 1;
+      if (count[w] > 10) return true;
+    }
+  }
   return false;
 }
 
 function extractMessageText(conv) {
   const parts = conv.conversation_parts?.conversation_parts || [];
-  const userParts = parts
+  const userPart = parts
     .filter(p => p.author?.type === 'user' && p.body)
-    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
-  
-  return cleanText(userParts[0]?.body || conv.source?.body || '');
+    .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))[0];
+
+  return cleanText(userPart?.body || conv.source?.body || '');
 }
 
-// ========================= ПЕРЕВОД =========================
+// ======================== ПЕРЕВОД ========================
 async function translateMessage(text) {
-  if (text.length > 4500) text = text.substring(0, 4500);
-  if (text.length < 6) return null;
+  if (text.length < 4 || text.length > 4900) return null;
 
-  // 1. Самая важная проверка — это английский?
-  const detected = franc(text, { minLength: 6, whitelist: ['eng', 'rus', 'ukr', 'spa', 'deu', 'fra', 'ita', 'por', 'pol', 'ces', 'nld', 'tur', 'ara', 'cmn', 'jpn', 'kor'] });
-  
+  // 1. Быстрая проверка — явно английский/русский/украинский?
+  const detected = franc(text, { minLength: 3 });
   if (detected === 'eng' || detected === 'rus' || detected === 'ukr') {
-    if (DEBUG) console.log('Язык определён как en/ru/uk — пропускаем перевод');
+    if (DEBUG) console.log('Пропуск: en/ru/uk', detected);
     return null;
   }
 
-  const sourceLang = {
-    spa: 'es', deu: 'de', fra: 'fr', ita: 'it', por: 'pt', pol: 'pl',
-    ces: 'cs', nld: 'nl', tur: 'tr', ara: 'ar', cmn: 'zh', kor: 'ko', jpn: 'ja'
-  }[detected] || 'auto';
-
-  if (sourceLang !== 'auto' && (SKIP_LANGS.has(sourceLang) || sourceLang === TARGET_LANG)) {
+  // 2. Кэш
+  const cacheKey = `tr:${text.substring(0, 200)}`;
+  if (CACHE.has(cacheKey)) {
+    const cached = CACHE.get(cacheKey);
+    if (cached !== 'garbage') return cached;
     return null;
   }
 
-  const cacheKey = `tr:${sourceLang}:${text.substring(0, 120)}`;
-  if (CACHE.has(cacheKey)) return CACHE.get(cacheKey);
-
+  // 3. Перебираем три живых инстанса
   for (const url of LIBRE_APIS) {
     try {
       const res = await axiosInstance.post(url, {
         q: text,
-        source: sourceLang,
-        target: TARGET_LANG,
+        source: 'auto',
+        target: 'en',
         format: 'text'
-      }, { timeout: 6500 });
+      }, { timeout: 8000 });
 
-      const translated = (res.data?.translatedText || res.data?.translation || '').trim();
-
+      const translated = (res.data?.translatedText || '').trim();
       if (!translated || translated === text.trim()) continue;
-      if (isObviouslyGarbage(translated)) {
-        if (DEBUG) console.log(`Блокировка мусора от ${url}:`, translated.substring(0, 120));
+      if (isGarbage(translated, text)) {
+        CACHE.set(cacheKey, 'garbage'); // больше не пытаемся
         continue;
       }
 
-      const finalSrc = (res.data.detectedLanguage?.language || sourceLang).toLowerCase();
-      if (finalSrc === TARGET_LANG || SKIP_LANGS.has(finalSrc)) continue;
+      const result = { 
+        text: translated, 
+        sourceLang: (res.data.detectedLanguage?.language || 'auto').slice(0, 2),
+        targetLang: 'en'
+      };
 
-      const result = { text: translated, sourceLang: finalSrc, targetLang: TARGET_LANG };
       CACHE.set(cacheKey, result);
       return result;
 
@@ -120,10 +123,12 @@ async function translateMessage(text) {
     }
   }
 
+  // Если все упали — кэшируем, что это мусор, чтобы не долбить снова
+  CACHE.set(cacheKey, 'garbage');
   return null;
 }
 
-// ========================= ХЕНДЛЕР =========================
+// ======================== WEBHOOK ========================
 app.post('/intercom-webhook', async (req, res) => {
   res.sendStatus(200);
   if (!ENABLED) return;
@@ -138,6 +143,7 @@ app.post('/intercom-webhook', async (req, res) => {
     const text = extractMessageText(data.item);
     if (!text) return;
 
+    // Антидубль
     const hash = `${convId}:${text.substring(0, 80)}`;
     if (PROCESSED.has(hash)) return;
     PROCESSED.set(hash, true);
@@ -145,7 +151,7 @@ app.post('/intercom-webhook', async (req, res) => {
     const translation = await translateMessage(text);
     if (!translation) return;
 
-    const note = `Auto-translation (${translation.sourceLang} → en):\n${translation.text}`;
+    const note = `Auto-translation (${translation.sourceLang} to en):\n${translation.text}`;
 
     await axiosInstance.post(
       `https://api.intercom.io/conversations/${convId}/reply`,
@@ -163,12 +169,13 @@ app.post('/intercom-webhook', async (req, res) => {
       }
     );
 
-    console.log(`Переведено [${translation.sourceLang}→en] — ${convId}`);
+    console.log(`Переведено [${translation.sourceLang} to en] — ${convId}`);
   } catch (err) {
-    console.error('Ошибка:', err.message);
+    console.error('Ошибка webhook:', err.message);
   }
 });
 
 app.get('/intercom-webhook', (_, res) => res.send('OK'));
+
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Автопереводчик запущен на порту ${PORT}`));
