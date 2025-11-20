@@ -9,9 +9,9 @@ import { francAll } from 'franc-all';
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json());
+app.use(bodyParser.json({ limit: '10mb' }));
 
-// Config
+// ========================= CONFIG =========================
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 const MYMEMORY_KEY = process.env.MYMEMORY_KEY || '';
@@ -23,334 +23,227 @@ const DEBUG = process.env.DEBUG === 'true';
 const INTERCOM_API_VERSION = '2.11';
 const INTERCOM_API_BASE = 'https://api.intercom.io';
 
-// ИСПРАВЛЕННЫЕ URL (проверено 20.11.2025)
+// Рабочие переводчики (ноябрь 2025)
 const PRIMARY_TRANSLATE_API_URL = 'https://libretranslate.de/translate';
 const FALLBACK_TRANSLATE_APIS = [
-  'https://translate.terraprint.co/translate',  // ← исправленный, живой
-  'https://libretranslate.eownerdead.dedyn.io/translate'  // ← третий, стабильный
+  'https://translate.terraprint.co/translate',
+  'https://libretranslate.eownerdead.dedyn.io/translate'
 ];
 const MYMEMORY_TRANSLATE_API_URL = 'https://api.mymemory.translated.net/get';
 
 const TRANSLATION_CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120, useClones: false });
 const REQUEST_TIMEOUT = 10000;
 
-const axiosInstance = axiosInstance.create({
+// ← ИСПРАВЛЕНО: правильное создание axiosInstance
+const axiosInstance = axios.create({
   timeout: REQUEST_TIMEOUT,
   httpAgent: new http.Agent({ keepAlive: true })
 });
 
-// Env check
-if (!INTERCOM_TOKEN || INTERCOM_TOKEN === 'Bearer ') process.exit(1);
-if (!ADMIN_ID) process.exit(1);
-console.log('Server starting with ENABLED:', ENABLED);
-if (MYMEMORY_KEY) console.log('MyMemory key loaded - rate limits reduced');
+// Маппинг языков (включая полные названия из Intercom)
+const LANG_MAP = {
+  'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
+  'it': 'it', 'pt': 'pt', 'pl': 'pl', 'cs': 'cs', 'nl': 'nl', 'tr': 'tr',
+  'ar': 'ar', 'zh': 'zh', 'ko': 'ko', 'ja': 'ja', 'he': 'he',
+  'English': 'en', 'Russian': 'ru', 'Ukrainian': 'uk',
+  'Spanish': 'es', 'German': 'de', 'French': 'fr',
+  'Italian': 'it', 'Portuguese': 'pt', 'Polish': 'pl',
+  'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
+  'Arabic': 'ar', 'Chinese': 'zh', 'Chinese (Simplified)': 'zh',
+  'Chinese (Traditional)': 'zh', 'Hebrew': 'he'
+};
 
-app.get('/intercom-webhook', (req, res) => res.status(200).send('Webhook verified'));
+// Защита от мусора
+function isGarbageTranslation(text) {
+  if (!text || typeof text !== 'string') return true;
+  const lower = text.toLowerCase();
+  return lower.includes('@@') ||
+         lower.includes('mainstre') ||
+         lower.includes('invalid source language') ||
+         lower.includes('mymemory_translate_api_url') ||
+         lower.includes('is an invalid') ||
+         lower.includes('example: langpair') ||
+         (text.length > 300 && text.split(' ').length < 15);
+}
+
+// ========================= ХЕНДЛЕРЫ =========================
+app.get('/intercom-webhook', (req, res) => res.status(200).send('OK'));
 
 app.post('/intercom-webhook', async (req, res) => {
-  const start = Date.now();
+  res.sendStatus(200);
+  if (!ENABLED) return;
+
   try {
-    res.sendStatus(200);
-    if (!ENABLED) return;
     const { topic, data } = req.body;
     if (!['conversation.user.replied', 'conversation.user.created'].includes(topic)) return;
+
     const conversation = data?.item;
     const conversationId = conversation?.id;
     if (!conversationId) return;
+
     const fullConversation = await fetchMinimalConversation(conversationId);
     if (!fullConversation) return;
+
     const messageText = extractMessageText(fullConversation, topic);
-    if (DEBUG) console.log(`Extracted: "${messageText}"`);
     if (!messageText || messageText.length < 3) return;
-    // Проверка на дубликат
-    const cacheKeyPrev = `prev:${conversationId}`;
-    const prevText = TRANSLATION_CACHE.get(cacheKeyPrev);
-    if (prevText === messageText) {
-      if (DEBUG) console.log('Duplicate message skipped');
-      return;
-    }
+
+    // Антидубль
+    const prevKey = `prev:${conversationId}`;
+    if (TRANSLATION_CACHE.get(prevKey) === messageText) return;
+
     let detectedLang = fullConversation?.language_override ||
                        fullConversation?.language ||
                        fullConversation?.custom_attributes?.Language ||
                        fullConversation?.source?.language ||
                        'auto';
-    if (DEBUG) console.log('Detected language from Intercom:', detectedLang);
+
+    if (DEBUG) console.log('Intercom language:', detectedLang, '| Text:', messageText.substring(0, 80));
+
     const translation = await translateMessage(messageText, detectedLang);
     if (!translation) return;
+
     await createInternalNote(conversationId, translation);
-    TRANSLATION_CACHE.set(cacheKeyPrev, messageText); // Сохраняем для следующего
-    console.log(`Processed ${conversationId} in ${Date.now() - start}ms`);
-  } catch (error) {
-    console.error('Webhook error:', error.message);
+    TRANSLATION_CACHE.set(prevKey, messageText);
+
+    console.log(`Переведено [${translation.sourceLang}→en] — ${conversationId}`);
+  } catch (err) {
+    console.error('Webhook error:', err.message);
   }
 });
 
-async function fetchMinimalConversation(conversationId) {
+// ========================= ВСПОМОГАТЕЛЬНЫЕ =========================
+async function fetchMinimalConversation(id) {
   try {
-    const response = await axiosInstance.get(
-      `${INTERCOM_API_BASE}/conversations/${conversationId}`,
-      {
-        headers: {
-          Authorization: INTERCOM_TOKEN,
-          Accept: 'application/json',
-          'Intercom-Version': INTERCOM_API_VERSION
-        }
+    const res = await axiosInstance.get(`${INTERCOM_API_BASE}/conversations/${id}`, {
+      headers: {
+        Authorization: INTERCOM_TOKEN,
+        'Intercom-Version': INTERCOM_API_VERSION,
+        Accept: 'application/json'
       }
-    );
-    if (DEBUG) console.log('Fetched conversation ID:', conversationId);
-    return response.data;
-  } catch (error) {
-    console.error('Error fetching conversation:', error.message);
-    if (error.response) console.error('Fetch error response:', error.response.data);
+    });
+    return res.data;
+  } catch (err) {
+    console.error('Failed to fetch conversation:', err.message);
     return null;
   }
 }
 
-function extractMessageText(conversation, webhookTopic) {
-  let rawBody = '';
-  let parts = conversation?.conversation_parts?.conversation_parts || [];
-  if (webhookTopic === 'conversation.user.created' && ['user', 'contact', 'lead'].includes(conversation?.source?.author?.type) && conversation.source.body) {
-    rawBody = conversation.source.body;
-    if (DEBUG) console.log('Using source.body for user.created');
-  } else if (parts.length > 0) {
-    if (DEBUG) console.log('Parts total count:', parts.length);
-    parts = parts
-      .filter(p => {
-        const authorType = p?.author?.type;
-        const partType = p?.part_type;
-        // Только user/lead/contact и только comment
-        return ['user', 'contact', 'lead'].includes(authorType) && partType === 'comment' && p?.body;
-      })
-      .sort((a, b) => (b.updated_at || b.created_at || 0) - (a.updated_at || a.created_at || 0));
-    if (DEBUG) console.log('Filtered client parts count:', parts.length);
-    if (parts[0]) {
-      rawBody = parts[0].body;
-    }
+function extractMessageText(conv, topic) {
+  let body = '';
+  if (topic === 'conversation.user.created' && conv.source?.body) {
+    body = conv.source.body;
+  } else {
+    const parts = conv.conversation_parts?.conversation_parts || [];
+    const userPart = parts
+      .filter(p => ['user', 'contact', 'lead'].includes(p.author?.type) && p.body)
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))[0];
+    body = userPart?.body || '';
   }
-  if (DEBUG && rawBody) console.log('Raw body before clean:', rawBody);
-  return cleanText(rawBody);
+  return cleanText(body);
 }
 
 function cleanText(text) {
   if (!text) return '';
-  text = text
-    .replace(/<br\s*\/?>/gi, ' [LINEBREAK] ')
-    .replace(/<\/p>/gi, ' [LINEBREAK] ')
-    .replace(/<p>/gi, '')
-    .replace(/<script\b[^<]*(?:(?!<\/script>)<[^<]*)*<\/script>/gi, ' ')
-    .replace(/<style\b[^<]*(?:(?!<\/style>)<[^<]*)*<\/style>/gi, ' ')
-    .replace(/<[^>]+>/g, ' ')
-    .replace(/id="[^"]*"/gi, '')
-    .replace(/class="[^"]*"/gi, '')
-    .replace(/menu-item-\d+/gi, '')
-    .replace(/license849 key[:\s]*[a-f0-9]{32}/gi, '')
-    .replace(/https?:\S+/g, '')
-    .replace(/&nbsp;|\u00A0|\u200B/g, ' ')
+  return text
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?[^>]+>/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
     .replace(/\s+/g, ' ')
-    .replace(/\[LINEBREAK\]/g, '\n')
     .trim();
-  text = text.split('\n').map(line => line.trim()).filter(line => line.length > 0).join('\n');
-  const lowerText = text.toLowerCase();
-  if ((/[a-zA-Z]="[^"]*"/.test(text) || /menu|select|option|dropdown/.test(lowerText)) && text.length < 50) {
-    if (DEBUG) console.log('Discarded as garbage:', text);
-    return '';
-  }
-  return text;
 }
 
-// ← НОВАЯ ФУНКЦИЯ: Защита от мусора
-function isGarbageTranslation(text) {
-  if (!text || typeof text !== 'string') return true;
-  const lower = text.toLowerCase();
-  if (lower.includes('@@') || lower.includes('mainstre')) return true;
-  if (lower.includes('invalid source language') || lower.includes('is an invalid')) return true;
-  if (lower.includes('mymemory_translate_api_url is not defined')) return true;
-  if (lower.includes('example: langpair')) return true;
-  if (text.length > 300 && text.split(' ').length < 15) return true; // повторяшки
-  return false;
-}
-
+// ========================= ПЕРЕВОД =========================
 async function translateMessage(text, detectedLang) {
   if (text.length > 5000) text = text.substring(0, 5000);
-  let sourceLang = detectedLang && LANG_MAP[detectedLang] ? LANG_MAP[detectedLang] : 'auto';
-  if (sourceLang.startsWith('zh')) sourceLang = 'zh';
-  if (DEBUG) console.log('Normalized source lang for API:', sourceLang);
 
-  // ← УЛУЧШЕНО: Жёсткий приоритет Intercom
-  if (sourceLang !== 'auto' && (SKIP_LANGS.includes(sourceLang) || sourceLang === TARGET_LANG)) {
-    console.log('Пропуск по language_override:', detectedLang, '→', sourceLang); // ← всегда лог
+  // Приоритет — language_override из Intercom
+  const mappedLang = LANG_MAP[detectedLang];
+  if (mappedLang && (SKIP_LANGS.includes(mappedLang) || mappedLang === TARGET_LANG)) {
+    if (DEBUG) console.log('Пропуск по language_override:', detectedLang);
     return null;
   }
 
-  let apiSource = sourceLang;
-  if (sourceLang === 'auto') {
-    let francCode = 'und';
-    try {
-      francCode = francAll(text, { minLength: 3 });
-    } catch (err) {
-      console.warn('Franc detection failed:', err.message);
-    }
-    const francMap = {
-      'cmn': 'zh', 'yue': 'zh', 'zho': 'zh',
-      'eng': 'en', 'rus': 'ru', 'ukr': 'uk', 'spa': 'es', 'deu': 'de', 'fra': 'fr',
-      'ita': 'it', 'por': 'pt', 'pol': 'pl', 'ces': 'cs', 'nld': 'nl', 'tur': 'tr',
-      'ara': 'ar', 'kor': 'ko', 'jpn': 'ja', 'heb': 'he'  // ← добавил иврит
-    };
-    apiSource = francMap[francCode] || LANG_MAP[francCode] || 'auto';
-    if (DEBUG) console.log('Franc fallback detected:', francCode, '→', apiSource);
+  const cacheKey = `tr:${text.substring(0, 150)}:${mappedLang || 'auto'}`;
+  if (TRANSLATION_CACHE.has(cacheKey)) return TRANSLATION_CACHE.get(cacheKey);
+
+  // 1. Primary
+  let result = await tryTranslateAPI(text, PRIMARY_TRANSLATE_API_URL);
+  if (result) return cacheAndReturn(result);
+
+  // 2. Fallbacks
+  for (const url of FALLBACK_TRANSLATE_APIS) {
+    result = await tryTranslateAPI(text, url);
+    if (result) return cacheAndReturn(result);
   }
-  if (apiSource === 'zh-Hant' || apiSource === 'zh-Hans') apiSource = 'zh';
-  if (apiSource === 'und' || SKIP_LANGS.includes(apiSource)) {
-    if (DEBUG) console.log('Skipping translation: Language is undefined or in SKIP_LANGS');
-    return null;
+
+  // 3. MyMemory (только если не иврит и не редкие)
+  if (!/[\u0590-\u05FF]/.test(text)) {
+    result = await tryMyMemory(text);
+    if (result) return cacheAndReturn(result);
   }
-  if (apiSource === TARGET_LANG) {
-    if (DEBUG) console.log('Skipping translation: Source language matches target language');
-    return null;
-  }
-  const cacheKey = `${text}:${apiSource}:${TARGET_LANG}`;
-  if (TRANSLATION_CACHE.has(cacheKey)) {
-    if (DEBUG) console.log('Returning cached translation');
-    return TRANSLATION_CACHE.get(cacheKey);
-  }
-  try {
-    const result = await translateWithAPI(text, apiSource, PRIMARY_TRANSLATE_API_URL);
-    if (result) return cacheAndReturn(result.text, result.source);
-  } catch (e) { console.warn('Primary API failed, trying fallbacks', e.message); }
-  // ← НОВОЕ: Пробуем все fallbacks
-  for (const fallbackUrl of FALLBACK_TRANSLATE_APIS) {
-    try {
-      const result = await translateWithAPI(text, apiSource, fallbackUrl);
-      if (result) return cacheAndReturn(result.text, result.source);
-    } catch (e) { 
-      console.warn(`Fallback ${fallbackUrl.split('/')[2]} failed:`, e.message); 
-    }
-  }
-  let result = await tryMyMemoryWithRetry(text, apiSource);
-  if (result) return cacheAndReturn(result.text, result.source);
+
   return null;
 
-  async function translateWithAPI(q, source, url) {
-    if (DEBUG) console.log(`Sending to API ${url.split('/')[2]}: text="${q}", source=${source}`);
-    const response = await axiosInstance.post(url, {
-      q, source, target: TARGET_LANG, format: 'text'
-    });
-    const respData = response.data;
-    if (DEBUG) console.log('API response:', JSON.stringify(respData, null, 2));
-    let transText = respData.translatedText?.trim();
-    if (!transText || transText.length < 1 || transText === q.trim()) return null;
+  async function tryTranslateAPI(q, url) {
+    try {
+      const res = await axiosInstance.post(url, {
+        q, source: 'auto', target: 'en', format: 'text'
+      }, { timeout: 9000 });
 
-    // ← ЗАЩИТА ОТ МУСОРА
-    if (isGarbageTranslation(transText)) {
-      console.warn(`Garbage blocked from ${url.split('/')[2]}:`, transText.substring(0, 100));
+      const translated = (res.data?.translatedText || '').trim();
+      if (!translated || translated === q.trim() || isGarbageTranslation(translated)) return null;
+
+      return { text: translated, sourceLang: 'auto', targetLang: 'en' };
+    } catch (err) {
+      if (DEBUG) console.log(`API ${url.split('/')[2]} failed:`, err.message);
       return null;
     }
-
-    const apiDetected = respData.detectedLanguage?.language || source;
-    const confidence = respData.detectedLanguage?.confidence || 100;
-    let detSource = source === 'auto' ? apiDetected : source;
-    if (confidence < 50) return null;
-    if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
-    return { text: transText, source: detSource };
   }
 
-  async function tryMyMemoryWithRetry(q, source) {
-    // ← ЗАЩИТА: Пропускаем MyMemory для редких языков (иврит и т.п.)
-    if (/[\u0590-\u05FF]/.test(q)) {  // иврит
-      console.warn('Skipping MyMemory for Hebrew/RTL text');
-      return null;
-    }
-    const lines = q.split('\n').map(line => line.trim()).filter(line => line.length > 0);
-    const translations = [];
-    let detSource = source;
-    const paramsBase = {
-      langpair: source === 'auto' ? 'auto|en' : `${source}|en`
-    };
-    if (MYMEMORY_KEY) paramsBase.key = MYMEMORY_KEY;
-    for (const line of lines) {
-      let success = false;
-      for (let retry = 0; retry < 3; retry++) {
-        let response;
-        try {
-          const params = { ...paramsBase, q: line };
-          response = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, { params });
-          success = true;
-        } catch (err) {
-          if (err.response?.status === 429) {
-            const wait = 2000 * (retry + 1);
-            console.warn(`MyMemory rate limit, waiting ${wait}ms and retry ${retry + 1}`);
-            await new Promise(resolve => setTimeout(resolve, wait));
-            continue;
-          }
-          console.warn('MyMemory request failed for line:', line, err.message);
-          break;
-        }
-        const respData = response.data.responseData;
-        const match = response.data.matches[0]?.translation?.trim();
-        if (!match || match === line.trim()) break;
-
-        // ← ЗАЩИТА ОТ МУСОРА
-        if (isGarbageTranslation(match)) {
-          console.warn('Garbage from MyMemory:', match.substring(0, 100));
-          return null;
-        }
-
-        translations.push(match);
-        if (!detSource || detSource === 'auto') {
-          detSource = respData.detectedLanguage || source;
-        }
-        break;
+  async function tryMyMemory(q) {
+    try {
+      const res = await axiosInstance.get(MYMEMORY_TRANSLATE_API_URL, {
+        params: { q, langpair: 'auto|en', key: MYMEMORY_KEY || undefined }
+      });
+      const translated = res.data.responseData?.translatedText?.trim();
+      if (translated && !isGarbageTranslation(translated) && translated !== q.trim()) {
+        return { text: translated, sourceLang: 'auto', targetLang: 'en' };
       }
-      if (!success) continue;
+    } catch (err) {
+      if (DEBUG) console.log('MyMemory failed:', err.message);
     }
-    if (translations.length === 0) return null;
-    const transText = translations.join('\n');
-    if (isGarbageTranslation(transText)) return null;
-    if (detSource === TARGET_LANG || SKIP_LANGS.includes(detSource)) return null;
-    return { text: transText, source: detSource };
+    return null;
   }
 
-  function cacheAndReturn(text, src) {
-    const translation = { text, sourceLang: src, targetLang: TARGET_LANG };
-    TRANSLATION_CACHE.set(cacheKey, translation);
-    return translation;
+  function cacheAndReturn(result) {
+    const final = { ...result, sourceLang: result.sourceLang || 'auto' };
+    TRANSLATION_CACHE.set(cacheKey, final);
+    return final;
   }
 }
 
-const LANG_MAP = {
-  'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
-  'it': 'it', 'pt': 'pt', 'pl': 'pl', 'cs': 'cs', 'nl': 'nl', 'tr': 'tr',
-  'ar': 'ar', 'zh': 'zh', 'zh-Hant': 'zh', 'zh-Hans': 'zh',
-  'English': 'en', 'Russian': 'ru', 'Ukrainian': 'uk', 'Spanish': 'es',
-  'German': 'de', 'French': 'fr', 'Italian': 'it', 'Portuguese': 'pt',
-  'Polish': 'pl', 'Czech': 'cs', 'Dutch': 'nl', 'Turkish': 'tr',
-  'Arabic': 'ar', 'Chinese': 'zh',
-  'Chinese (Taiwan)': 'zh-Hant', 'Chinese (Simplified)': 'zh-Hans', 'Chinese (Traditional)': 'zh-Hant', 'Traditional Chinese': 'zh-Hant',
-  'ko': 'ko', 'ja': 'ja',
-  'zh-TW': 'zh', 'zh-CN': 'zh', 'he': 'he', 'Hebrew': 'he'  // ← добавил иврит
-};
-
-async function createInternalNote(conversationId, translation) {
+async function createInternalNote(convId, translation) {
   try {
-    const noteBody = `Auto-translation (${translation.sourceLang} → ${translation.targetLang}): ${translation.text}`;
     await axiosInstance.post(
-      `${INTERCOM_API_BASE}/conversations/${conversationId}/reply`,
-      { message_type: 'note', admin_id: ADMIN_ID, body: noteBody },
+      `${INTERCOM_API_BASE}/conversations/${convId}/reply`,
+      {
+        message_type: 'note',
+        admin_id: ADMIN_ID,
+        body: `Auto-translation → en:\n${translation.text}`
+      },
       {
         headers: {
           Authorization: INTERCOM_TOKEN,
-          'Content-Type': 'application/json',
-          Accept: 'application/json',
-          'Intercom-Version': INTERCOM_API_VERSION
+          'Intercom-Version': INTERCOM_API_VERSION,
+          'Content-Type': 'application/json'
         }
       }
     );
-    if (DEBUG) console.log('Internal note created successfully');
-  } catch (error) {
-    console.error('Note error:', error.message);
-    if (error.response) console.error('Note error response:', error.response.data);
+  } catch (err) {
+    console.error('Failed to create note:', err.message);
   }
 }
 
+// ========================= ЗАПУСК =========================
 const PORT = process.env.PORT || 10000;
-app.listen(PORT, () => console.log(`Server on ${PORT}`));
+app.listen(PORT, () => console.log(`Автопереводчик запущен на порту ${PORT}`));
