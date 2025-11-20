@@ -207,20 +207,53 @@ async function retryTranslateLibre(text, source, url, retries = 3) {
 }
 
 // MyMemory
+// ← ЗАМЕНИ ВСЮ ФУНКЦИЮ tryMyMemory НА ЭТУ
 async function tryMyMemory(text, source) {
   try {
-    const pair = source === 'he' ? 'he|en' : (source === 'auto' ? 'auto|en' : `${source}|en`);
+    // Принудительно ставим he|en для любого ивритского текста
+    const isHebrew = /[\u0590-\u05FF]/.test(text) || source === 'he';
+    const pair = isHebrew ? 'he|en' : (source === 'auto' ? 'auto|en' : `${source}|en`);
+
     const res = await axiosInstance.get(MYMEMORY_URL, {
-      params: { q: text, langpair: pair, key: MYMEMORY_KEY || undefined }
+      params: { 
+        q: text, 
+        langpair: pair, 
+        key: MYMEMORY_KEY || undefined 
+      }
     });
-    const translated = res.data.responseData?.translatedText?.trim();
-    if (translated && !isGarbage(translated) && translated !== text) {
-      return { text: translated, sourceLang: source === 'auto' ? 'auto' : source };
+
+    let translated = res.data.responseData?.translatedText?.trim();
+
+    if (!translated || translated === text) return null;
+
+    // ЗАЩИТА ОТ ТРАНСЛИТА (самое важное!)
+    const lowerOrig = text.toLowerCase();
+    const lowerTrans = translated.toLowerCase();
+
+    // Если перевод содержит те же буквы, что и оригинал — это транслит → отбрасываем
+    if (isHebrew && (
+        translated.includes('meushar') || 
+        translated.includes('maushar') ||
+        translated.includes('meusar') ||
+        translated.includes('mausar') ||
+        lowerTrans.replace(/[^a-z]/g, '') === lowerOrig.replace(/[^א-ת]/g, '').replace(/[א]/g,'a').replace(/[ע]/g,'e') // грубая проверка
+    )) {
+      if (DEBUG) console.log('MyMemory отдал транслит — блокируем:', translated);
+      return null;
     }
+
+    // Блокируем мусор
+    if (isGarbage(translated)) return null;
+
+    return { 
+      text: translated, 
+      sourceLang: isHebrew ? 'he' : (source === 'auto' ? 'auto' : source) 
+    };
+
   } catch (err) {
     if (DEBUG) console.log('MyMemory error:', err.message);
+    return null;
   }
-  return null;
 }
 
 // ========================= НОТС =========================
