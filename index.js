@@ -61,6 +61,15 @@ function isGarbage(text) {
          t.includes('example: langpair') || (text.length > 300 && text.split(' ').length < 10);
 }
 
+// Функция для проверки, является ли перевод транслитом (простая евристика)
+function isTranslit(original, translated) {
+  // Для иврита: если перевод содержит только latin буквы, похожие на транслит
+  if (/[\u0590-\u05FF]/.test(original) && /^[a-zA-Z\s.,!?-]+$/.test(translated)) {
+    return true;
+  }
+  return false;
+}
+
 // ========================= ХЕНДЛЕР =========================
 app.get('/intercom-webhook', (_, res) => res.send('OK'));
 app.post('/intercom-webhook', async (req, res) => {
@@ -132,12 +141,12 @@ async function translate(text, detectedLang) {
   for (const url of LIBRE_INSTANCES) {
     if (await isHealthy(url)) {
       result = await tryLibre(text, sourceForAPI, url);
-      if (result) return cache(result);
+      if (result && !isTranslit(text, result.text)) return cache(result);
     }
   }
   // 2. MyMemory (надёжный резерв)
   result = await tryMyMemory(text, sourceForAPI);
-  if (result) return cache(result);
+  if (result && !isTranslit(text, result.text)) return cache(result);
   return null;
   function cache(res) {
     CACHE.set(cacheKey, res);
