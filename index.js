@@ -23,32 +23,27 @@ const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.11';
 const INTERCOM_API_BASE = 'https://api.intercom.io';
 
-// Самые живые инстансы LibreTranslate (ноябрь 2025)
+// Стабильные LibreTranslate (ноябрь 2025, из GitHub-листов)
 const LIBRE_INSTANCES = [
-  'https://libretranslate.de/translate',
-  'https://translate.argosopentech.com/translate',     // лучший для иврита
-  'https://libretranslate.freehosted.uk/translate',
-  'https://translate.jhelwig.de/translate',
-  'https://translate.languagetools.org/translate',
-  'https://translate.fedilab.app/translate'
+  'https://libretranslate.de/translate',        // №1, всегда живой
+  'https://translate.terraprint.co/translate',  // №2, стабильный
+  'https://translate.fedilab.app/translate'     // №3, резерв
 ];
-
-// Дополнительные бесплатные движки
-const LINGVA_URL = 'https://lingva.ml/api/v1/translate';           // Google без ключа
-const APERTIUM_URL = 'https://www.apertium.org/apy/translate';     // отличный иврит
 
 const MYMEMORY_URL = 'https://api.mymemory.translated.net/get';
 
 const CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
-const PROCESSED = new NodeCache({ stdTTL: 30, checkperiod: 60 });
+const PROCESSED = new NodeCache({ stdTTL: 60, checkperiod: 60 }); // Антидубль 1 мин
 
 const axiosInstance = axios.create({
   timeout: 12000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: { 'User-Agent': 'IntercomAutoTranslate/2.0 (+https://github.com/yourname)' }
+  headers: { 
+    'User-Agent': 'Mozilla/5.0 (compatible; TranslationBot/1.0)' // Обход Cloudflare
+  }
 });
 
-// Маппинг всех возможных значений language_override
+// Маппинг языков (Intercom → коды)
 const LANG_MAP = {
   'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'he': 'he', 'ar': 'ar', 'zh': 'zh',
@@ -82,7 +77,9 @@ app.post('/intercom-webhook', async (req, res) => {
     const convId = conv?.id;
     if (!convId) return;
 
-    const key = `${convId}:${topic}`;
+    // Улучшенный антидубль (по ID + хэш текста)
+    const textHash = require('crypto').createHash('md5').update(conv.body || '').digest('hex').slice(0, 8);
+    const key = `${convId}:${textHash}`;
     if (PROCESSED.has(key)) return;
     PROCESSED.set(key, true);
 
@@ -147,21 +144,15 @@ async function translate(text, detectedLang) {
 
   let result;
 
-  // 1. Lingva (Google-качество) — самый точный
-  result = await tryLingva(text, langCode);
-  if (result) return cache(result);
-
-  // 2. Apertium — отличный для иврита и коротких фраз
-  result = await tryApertium(text, langCode);
-  if (result) return cache(result);
-
-  // 3. LibreTranslate (все живые инстансы)
+  // 2. LibreTranslate с retry и health-check
   for (const url of LIBRE_INSTANCES) {
-    result = await tryLibre(text, langCode === 'auto' ? 'auto' : langCode, url);
-    if (result) return cache(result);
+    if (await isLibreHealthy(url)) {
+      result = await retryTranslateLibre(text, langCode === 'auto' ? 'auto' : langCode, url);
+      if (result) return cache(result);
+    }
   }
 
-  // 4. MyMemory (последний резерв)
+  // 3. MyMemory (надёжный резерв)
   result = await tryMyMemory(text, langCode);
   if (result) return cache(result);
 
@@ -173,65 +164,48 @@ async function translate(text, detectedLang) {
   }
 }
 
-// — Lingva (Google без ключа)
-async function tryLingva(text, source) {
+// Health-check для Libre (GET /languages)
+async function isLibreHealthy(baseUrl) {
   try {
-    const res = await axiosInstance.post(LINGVA_URL, {
-      q: text,
-      source: source === 'auto' ? 'auto' : source,
-      target: 'en'
-    });
-    const translated = res.data?.translated;
-    if (translated && !isGarbage(translated) && translated !== text) {
-      return { text: translated.trim(), sourceLang: source === 'auto' ? 'auto' : source };
-    }
-  } catch (err) {
-    if (DEBUG) console.log('Lingva error:', err.message);
+    const res = await axiosInstance.get(baseUrl.replace('/translate', '/languages'), { timeout: 5000 });
+    return res.status === 200 && Array.isArray(res.data);
+  } catch {
+    return false;
   }
-  return null;
 }
 
-// — Apertium (отличный иврит)
-async function tryApertium(text, source) {
-  if (source !== 'he' && source !== 'auto') return null;
-  try {
-    const res = await axiosInstance.post(APERTIUM_URL, null, {
-      params: { langpair: 'he|en', q: text }
-    });
-    const translated = res.data?.responseData?.translatedText;
-    if (translated && !isGarbage(translated)) {
-      return { text: translated.trim(), sourceLang: 'he' };
-    }
-  } catch (err) {
-    if (DEBUG) console.log('Apertium error:', err.message);
-  }
-  return null;
-}
+// Retry для Libre (3 попытки при 502/403)
+async function retryTranslateLibre(text, source, url, retries = 3) {
+  for (let i = 0; i < retries; i++) {
+    try {
+      const res = await axiosInstance.post(url, {
+        q: text,
+        source,
+        target: 'en',
+        format: 'text'
+      }, { timeout: 10000 });
 
-// — LibreTranslate
-async function tryLibre(text, source, url) {
-  try {
-    const res = await axiosInstance.post(url, {
-      q: text,
-      source,
-      target: 'en',
-      format: 'text'
-    }, { timeout: 10000 });
-
-    const translated = (res.data?.translatedText || '').trim();
-    if (translated && translated !== text && !isGarbage(translated)) {
-      const detected = res.data.detectedLanguage?.language || source;
-      if (detected !== 'en') {
-        return { text: translated, sourceLang: detected };
+      const translated = (res.data?.translatedText || '').trim();
+      if (translated && translated !== text && !isGarbage(translated)) {
+        const detected = res.data.detectedLanguage?.language || source;
+        if (detected !== 'en') {
+          return { text: translated, sourceLang: detected.slice(0, 2) };
+        }
+      }
+      break; // Нормальный ответ, выходим
+    } catch (err) {
+      if (DEBUG) console.log(`${url.split('/')[2]} attempt ${i+1}: ${err.message}`);
+      if (err.response?.status === 502 || err.response?.status === 403) {
+        await new Promise(r => setTimeout(r, 2000 * (i + 1))); // Пауза
+      } else {
+        break; // Не retry для других ошибок
       }
     }
-  } catch (err) {
-    if (DEBUG) console.log(`${url.split('/')[2]}: ${err.message}`);
   }
   return null;
 }
 
-// — MyMemory
+// MyMemory
 async function tryMyMemory(text, source) {
   try {
     const pair = source === 'he' ? 'he|en' : (source === 'auto' ? 'auto|en' : `${source}|en`);
