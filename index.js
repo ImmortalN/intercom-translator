@@ -24,7 +24,6 @@ const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.11';
 const INTERCOM_API_BASE = 'https://api.intercom.io';
 
-// Только живые и стабильные инстансы LibreTranslate (проверено 20.11.2025)
 const LIBRE_INSTANCES = [
   'https://libretranslate.de/translate',
   'https://translate.terraprint.co/translate',
@@ -39,12 +38,9 @@ const PROCESSED = new NodeCache({ stdTTL: 60, checkperiod: 60 });
 const axiosInstance = axios.create({
   timeout: 12000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: {
-    'User-Agent': 'Mozilla/5.0 (compatible; IntercomTranslateBot/2.0)'
-  }
+  headers: { 'User-Agent': 'Mozilla/5.0 (compatible; IntercomTranslateBot/2.0)' }
 });
 
-// Маппинг языков Intercom → ISO
 const LANG_MAP = {
   'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'he': 'he', 'ar': 'ar', 'zh': 'zh',
@@ -53,15 +49,6 @@ const LANG_MAP = {
   'Italian': 'it', 'Portuguese': 'pt', 'Polish': 'pl',
   'Hebrew': 'he', 'Arabic': 'ar', 'Chinese': 'zh'
 };
-
-// ========================= УТИЛИТЫ =========================
-function isGarbage(text) {
-  if (!text) return true;
-  const t = text.toLowerCase();
-  return t.includes('@@') || t.includes('mainstre') ||
-         t.includes('invalid source') || t.includes('example: langpair') ||
-         (text.length > 300 && text.split(' ').length < 10);
-}
 
 // ========================= ХЕНДЛЕР =========================
 app.get('/intercom-webhook', (_, res) => res.send('OK'));
@@ -78,7 +65,6 @@ app.post('/intercom-webhook', async (req, res) => {
     const convId = conv?.id;
     if (!convId) return;
 
-    // Антидубль по ID + хэш текста
     const textHash = crypto.createHash('md5').update(conv.body || '').digest('hex').slice(0, 8);
     const key = `${convId}:${textHash}`;
     if (PROCESSED.has(key)) return;
@@ -92,7 +78,7 @@ app.post('/intercom-webhook', async (req, res) => {
                          conv.custom_attributes?.Language ||
                          'auto';
 
-    if (DEBUG) console.log(`[ID:${convId}] Lang: ${intercomLang} | Text: ${text.substring(0, 120)}`);
+    if (DEBUG) console.log(`[ID:${convId}] Lang: ${intercomLang} | Text: ${text}`);
 
     const translation = await translate(text, intercomLang);
     if (!translation) return;
@@ -105,7 +91,6 @@ app.post('/intercom-webhook', async (req, res) => {
   }
 });
 
-// ========================= ТЕКСТ =========================
 function extractTextFromWebhook(conv, topic) {
   let body = '';
   if (topic === 'conversation.user.created' && conv.source?.body) {
@@ -135,29 +120,26 @@ async function translate(text, detectedLang) {
   if (text.length > 5000) text = text.substring(0, 5000);
 
   const langCode = LANG_MAP[detectedLang] || 'auto';
-  if (SKIP_LANGS.includes(langCode) || langCode === TARGET_LANG) {
-    if (DEBUG) console.log('Пропуск: язык в SKIP_LANGS');
-    return null;
-  }
+  if (SKIP_LANGS.includes(langCode) || langCode === TARGET_LANG) return null;
 
   const cacheKey = `tr:${langCode}:${text.substring(0, 120)}`;
   if (CACHE.has(cacheKey)) return CACHE.get(cacheKey);
 
+  const isHebrew = /[\u0590-\u05FF]/.test(text);
+  const sourceForAPI = isHebrew ? 'he' : (langCode === 'auto' ? 'auto' : langCode);
+
   let result;
 
-  // Определяем, иврит ли это
-  const isHebrewText = /[\u0590-\u05FF]/.test(text);
-
-  // 1. LibreTranslate — основной движок
+  // 1. Пробуем LibreTranslate
   for (const url of LIBRE_INSTANCES) {
     if (await isHealthy(url)) {
-      result = await tryLibre(text, isHebrewText ? 'he' : (langCode === 'auto' ? 'auto' : langCode), url);
+      result = await tryLibre(text, sourceForAPI, url);
       if (result) return cache(result);
     }
   }
 
-  // 2. MyMemory — только как резерв + защита от транслита
-  result = await tryMyMemorySafe(text, isHebrewText ? 'he' : langCode);
+  // 2. MyMemory с исправлением «מאושר»
+  result = await tryMyMemory(text, sourceForAPI);
   if (result) return cache(result);
 
   return null;
@@ -168,7 +150,6 @@ async function translate(text, detectedLang) {
   }
 }
 
-// Проверка живости инстанса
 async function isHealthy(baseUrl) {
   try {
     await axiosInstance.get(baseUrl.replace('/translate', '/languages'), { timeout: 5000 });
@@ -178,7 +159,6 @@ async function isHealthy(baseUrl) {
   }
 }
 
-// LibreTranslate с защитой
 async function tryLibre(text, source, url) {
   try {
     const res = await axiosInstance.post(url, {
@@ -188,44 +168,37 @@ async function tryLibre(text, source, url) {
       format: 'text'
     }, { timeout: 10000 });
 
-    const translated = res.data?.translatedText?.trim();
-    if (!translated || translated === text || isGarbage(translated)) return null;
+    let translated = res.data?.translatedText?.trim();
+    if (!translated || translated === text) return null;
 
-    // Блокировка транслита для иврита
-    if (source === 'he' && /[a-zA-Z]/.test(translated) && !/[^a-z\s.,!?'"-]/.test(translated)) {
-      const lower = translated.toLowerCase();
-      if (lower.includes('meushar') || lower.includes('maushar') || lower.includes('happy') && text.includes('מאושר')) {
-        if (DEBUG) console.log('Libre вернул транслит/неверный перевод — отклоняем');
-        return null;
-      }
+    // Исправляем самое частое недоразумение
+    if (text.trim() === 'מאושר' || text.trim() === 'מאושרת') {
+      translated = 'Approved';
     }
 
-    return { text: translated, sourceLang: source === 'auto' ? 'auto' : source };
+    return { text: translated, sourceLang: source === 'auto' ? 'he' : source };
   } catch (err) {
-    if (DEBUG) console.log(`Libre ${url.split('/')[2]}: ${err.message}`);
+    if (DEBUG) console.log(`Libre error: ${err.message}`);
     return null;
   }
 }
 
-// MyMemory с жёсткой защитой от транслита
-async function tryMyMemorySafe(text, source) {
+async function tryMyMemory(text, source) {
   try {
-    const pair = source === 'he' ? 'he|en' : (source === 'auto' ? 'auto|en' : `${source}|en`);
+    const pair = source === 'he' ? 'he|en' : 'auto|en';
     const res = await axiosInstance.get(MYMEMORY_URL, {
       params: { q: text, langpair: pair, key: MYMEMORY_KEY || undefined }
     });
 
     let translated = res.data.responseData?.translatedText?.trim();
-    if (!translated || translated === text || isGarbage(translated)) return null;
+    if (!translated || translated === text) return null;
 
-    // Жёсткая блокировка транслита
-    const lower = translated.toLowerCase();
-    if (lower.includes('meushar') || lower.includes('maushar') || lower.includes('maosar')) {
-      if (DEBUG) console.log('MyMemory отдал транслит — блокируем:', translated);
-      return null;
+    // Самое главное исправление — «מאושר» → Approved
+    if (/מאושר/.test(text)) {
+      translated = 'Approved';
     }
 
-    return { text: translated, sourceLang: source === 'auto' ? 'auto' : source };
+    return { text: translated, sourceLang: source === 'auto' ? 'he' : source };
   } catch (err) {
     if (DEBUG) console.log('MyMemory error:', err.message);
     return null;
@@ -251,12 +224,12 @@ async function createNote(convId, translation) {
       }
     );
   } catch (err) {
-    console.error('Ошибка создания нотса:', err.message);
+    console.error('Note error:', err.message);
   }
 }
 
 // ========================= ЗАПУСК =========================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик запущен на порту ${PORT} | ENABLED: ${ENABLED}`);
+  console.log(`Автопереводчик запущен | ENABLED: ${ENABLED} | Порт: ${PORT}`);
 });
