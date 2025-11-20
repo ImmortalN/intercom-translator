@@ -4,6 +4,7 @@ import axios from 'axios';
 import http from 'http';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
+import crypto from 'node:crypto';
 
 dotenv.config();
 
@@ -78,7 +79,7 @@ app.post('/intercom-webhook', async (req, res) => {
     if (!convId) return;
 
     // Улучшенный антидубль (по ID + хэш текста)
-    const textHash = require('crypto').createHash('md5').update(conv.body || '').digest('hex').slice(0, 8);
+    const textHash = crypto.createHash('md5').update(conv.body || '').digest('hex').slice(0, 8);
     const key = `${convId}:${textHash}`;
     if (PROCESSED.has(key)) return;
     PROCESSED.set(key, true);
