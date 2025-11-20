@@ -23,25 +23,32 @@ const SKIP_LANGS = ['en', 'ru', 'uk'];
 const INTERCOM_API_VERSION = '2.11';
 const INTERCOM_API_BASE = 'https://api.intercom.io';
 
-// Самые надёжные инстансы (проверено 20.11.2025)
-const PRIMARY_API = 'https://libretranslate.de/translate';
-const BEST_FOR_HEBREW = 'https://translate.argosopentech.com/translate'; // ← идеальный иврит
-const FALLBACK_APIS = [
-  'https://translate.terraprint.co/translate',
+// Самые живые инстансы LibreTranslate (ноябрь 2025)
+const LIBRE_INSTANCES = [
+  'https://libretranslate.de/translate',
+  'https://translate.argosopentech.com/translate',     // лучший для иврита
+  'https://libretranslate.freehosted.uk/translate',
+  'https://translate.jhelwig.de/translate',
+  'https://translate.languagetools.org/translate',
   'https://translate.fedilab.app/translate'
 ];
+
+// Дополнительные бесплатные движки
+const LINGVA_URL = 'https://lingva.ml/api/v1/translate';           // Google без ключа
+const APERTIUM_URL = 'https://www.apertium.org/apy/translate';     // отличный иврит
 
 const MYMEMORY_URL = 'https://api.mymemory.translated.net/get';
 
 const CACHE = new NodeCache({ stdTTL: 3600, checkperiod: 120 });
-const PROCESSED = new NodeCache({ stdTTL: 30, checkperiod: 60 }); // антидубль 30 сек
+const PROCESSED = new NodeCache({ stdTTL: 30, checkperiod: 60 });
 
 const axiosInstance = axios.create({
-  timeout: 10000,
-  httpAgent: new http.Agent({ keepAlive: true })
+  timeout: 12000,
+  httpAgent: new http.Agent({ keepAlive: true }),
+  headers: { 'User-Agent': 'IntercomAutoTranslate/2.0 (+https://github.com/yourname)' }
 });
 
-// Полный маппинг языков Intercom → коды
+// Маппинг всех возможных значений language_override
 const LANG_MAP = {
   'en': 'en', 'ru': 'ru', 'uk': 'uk', 'es': 'es', 'de': 'de', 'fr': 'fr',
   'it': 'it', 'pt': 'pt', 'pl': 'pl', 'he': 'he', 'ar': 'ar', 'zh': 'zh',
@@ -52,16 +59,12 @@ const LANG_MAP = {
   'Chinese (Simplified)': 'zh', 'Chinese (Traditional)': 'zh'
 };
 
-// Защита от мусора
 function isGarbage(text) {
   if (!text) return true;
   const t = text.toLowerCase();
-  return t.includes('@@') ||
-         t.includes('mainstre') ||
-         t.includes('invalid source') ||
-         t.includes('mymemory_translate_api_url') ||
-         t.includes('example: langpair') ||
-         (text.length > 300 && text.split(' ').length < 10);
+  return t.includes('@@') || t.includes('mainstre') ||
+         t.includes('invalid source') || t.includes('mymemory_translate_api_url') ||
+         t.includes('example: langpair') || (text.length > 300 && text.split(' ').length < 10);
 }
 
 // ========================= ХЕНДЛЕР =========================
@@ -79,22 +82,19 @@ app.post('/intercom-webhook', async (req, res) => {
     const convId = conv?.id;
     if (!convId) return;
 
-    // Антидубль
     const key = `${convId}:${topic}`;
     if (PROCESSED.has(key)) return;
     PROCESSED.set(key, true);
 
-    // Берём текст прямо из webhook — без лишнего fetch!
     const text = extractTextFromWebhook(conv, topic);
     if (!text || text.length < 3) return;
 
-    // Язык из Intercom (самый приоритетный)
     const intercomLang = conv.language_override ||
                          conv.source?.language ||
                          conv.custom_attributes?.Language ||
                          'auto';
 
-    if (DEBUG) console.log(`[ID:${convId}] Lang: ${intercomLang} | Text: ${text.substring(0, 100)}`);
+    if (DEBUG) console.log(`[ID:${convId}] Lang: ${intercomLang} | Text: ${text.substring(0, 120)}`);
 
     const translation = await translate(text, intercomLang);
     if (!translation) return;
@@ -103,24 +103,22 @@ app.post('/intercom-webhook', async (req, res) => {
     console.log(`Переведено [${translation.sourceLang}→en] — ${convId}`);
 
   } catch (err) {
-    console.error('Ошибка webhook:', err.message);
+    console.error('Webhook error:', err.message);
   }
 });
 
 // ========================= ТЕКСТ =========================
 function extractTextFromWebhook(conv, topic) {
   let body = '';
-
   if (topic === 'conversation.user.created' && conv.source?.body) {
     body = conv.source.body;
   } else {
     const parts = conv.conversation_parts?.conversation_parts || [];
-    const lastUserPart = parts
+    const last = parts
       .filter(p => ['user', 'contact', 'lead'].includes(p.author?.type) && p.body)
       .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))[0];
-    body = lastUserPart?.body || '';
+    body = last?.body || '';
   }
-
   return cleanText(body);
 }
 
@@ -139,10 +137,8 @@ async function translate(text, detectedLang) {
   if (text.length > 5000) text = text.substring(0, 5000);
 
   const langCode = LANG_MAP[detectedLang] || 'auto';
-
-  // Пропускаем английский/русский/украинский
   if (SKIP_LANGS.includes(langCode) || langCode === TARGET_LANG) {
-    if (DEBUG) console.log('Пропуск: язык в SKIP_LANGS или уже en');
+    if (DEBUG) console.log('Пропуск: язык в SKIP_LANGS');
     return null;
   }
 
@@ -151,22 +147,21 @@ async function translate(text, detectedLang) {
 
   let result;
 
-  // Иврит — всегда в Argos (идеальный перевод)
-  if (langCode === 'he' || /[\u0590-\u05FF]/.test(text)) {
-    result = await tryAPI(text, 'he', BEST_FOR_HEBREW);
-    if (result) return cache(result);
-  }
-
-  // Обычная цепочка
-  result = await tryAPI(text, langCode === 'auto' ? 'auto' : langCode, PRIMARY_API);
+  // 1. Lingva (Google-качество) — самый точный
+  result = await tryLingva(text, langCode);
   if (result) return cache(result);
 
-  for (const url of FALLBACK_APIS) {
-    result = await tryAPI(text, langCode === 'auto' ? 'auto' : langCode, url);
+  // 2. Apertium — отличный для иврита и коротких фраз
+  result = await tryApertium(text, langCode);
+  if (result) return cache(result);
+
+  // 3. LibreTranslate (все живые инстансы)
+  for (const url of LIBRE_INSTANCES) {
+    result = await tryLibre(text, langCode === 'auto' ? 'auto' : langCode, url);
     if (result) return cache(result);
   }
 
-  // MyMemory как последний резерв
+  // 4. MyMemory (последний резерв)
   result = await tryMyMemory(text, langCode);
   if (result) return cache(result);
 
@@ -178,37 +173,74 @@ async function translate(text, detectedLang) {
   }
 }
 
-async function tryAPI(text, source, url) {
+// — Lingva (Google без ключа)
+async function tryLingva(text, source) {
+  try {
+    const res = await axiosInstance.post(LINGVA_URL, {
+      q: text,
+      source: source === 'auto' ? 'auto' : source,
+      target: 'en'
+    });
+    const translated = res.data?.translated;
+    if (translated && !isGarbage(translated) && translated !== text) {
+      return { text: translated.trim(), sourceLang: source === 'auto' ? 'auto' : source };
+    }
+  } catch (err) {
+    if (DEBUG) console.log('Lingva error:', err.message);
+  }
+  return null;
+}
+
+// — Apertium (отличный иврит)
+async function tryApertium(text, source) {
+  if (source !== 'he' && source !== 'auto') return null;
+  try {
+    const res = await axiosInstance.post(APERTIUM_URL, null, {
+      params: { langpair: 'he|en', q: text }
+    });
+    const translated = res.data?.responseData?.translatedText;
+    if (translated && !isGarbage(translated)) {
+      return { text: translated.trim(), sourceLang: 'he' };
+    }
+  } catch (err) {
+    if (DEBUG) console.log('Apertium error:', err.message);
+  }
+  return null;
+}
+
+// — LibreTranslate
+async function tryLibre(text, source, url) {
   try {
     const res = await axiosInstance.post(url, {
       q: text,
       source,
       target: 'en',
       format: 'text'
-    }, { timeout: 9000 });
+    }, { timeout: 10000 });
 
     const translated = (res.data?.translatedText || '').trim();
-    if (!translated || translated === text || isGarbage(translated)) return null;
-
-    const detected = res.data.detectedLanguage?.language || source;
-    if (detected === 'en') return null;
-
-    return { text: translated, sourceLang: detected.slice(0, 2) };
+    if (translated && translated !== text && !isGarbage(translated)) {
+      const detected = res.data.detectedLanguage?.language || source;
+      if (detected !== 'en') {
+        return { text: translated, sourceLang: detected };
+      }
+    }
   } catch (err) {
-    if (DEBUG) console.log(`API ${url.split('/')[2]}: ${err.message}`);
-    return null;
+    if (DEBUG) console.log(`${url.split('/')[2]}: ${err.message}`);
   }
+  return null;
 }
 
-async function tryMyMemory(text, sourceLang) {
+// — MyMemory
+async function tryMyMemory(text, source) {
   try {
-    const pair = sourceLang === 'he' ? 'he|en' : (sourceLang === 'auto' ? 'auto|en' : `${sourceLang}|en`);
+    const pair = source === 'he' ? 'he|en' : (source === 'auto' ? 'auto|en' : `${source}|en`);
     const res = await axiosInstance.get(MYMEMORY_URL, {
       params: { q: text, langpair: pair, key: MYMEMORY_KEY || undefined }
     });
     const translated = res.data.responseData?.translatedText?.trim();
     if (translated && !isGarbage(translated) && translated !== text) {
-      return { text: translated, sourceLang: sourceLang === 'auto' ? 'auto' : sourceLang };
+      return { text: translated, sourceLang: source === 'auto' ? 'auto' : source };
     }
   } catch (err) {
     if (DEBUG) console.log('MyMemory error:', err.message);
@@ -242,6 +274,5 @@ async function createNote(convId, translation) {
 // ========================= ЗАПУСК =========================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик запущен на порту ${PORT}`);
-  console.log(`Режим: ${ENABLED ? 'ВКЛЮЧЁН' : 'ВЫКЛЮЧЕН'} | DEBUG: ${DEBUG}`);
+  console.log(`Автопереводчик запущен на порту ${PORT} | ENABLED: ${ENABLED}`);
 });
