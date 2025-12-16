@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json({ limit: '10mb' ));
+app.use(bodyParser.json({ limit: '10mb' }));  // ← Исправлено: одна скобка
 
 // ========================= CONFIG =========================
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
@@ -35,7 +35,7 @@ const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 const axiosInstance = axios.create({
   timeout: 15000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: { 'User-Agent': 'IntercomAutoTranslate/8.0' }
+  headers: { 'User-Agent': 'IntercomAutoTranslate/8.1' }
 });
 
 // ========================= УТИЛИТЫ =========================
@@ -57,27 +57,19 @@ function isGarbage(text = '') {
          lower.includes('mymemory');
 }
 
-// Сравнение похожести текстов (если перевод почти такой же — это английский)
+// Простое сравнение похожести (достаточно для английского)
 function isProbablyEnglish(original, translated) {
   const o = original.toLowerCase().replace(/[^\w\s]/g, '');
   const t = translated.toLowerCase().replace(/[^\w\s]/g, '');
   if (o.length === 0) return true;
-  const distance = levenshteinDistance(o, t);
-  const similarity = 1 - distance / Math.max(o.length, t.length);
-  return similarity > 0.85; // больше 85 % совпадений → считаем английским
-}
-
-// Простая функция расстояния Левенштейна
-function levenshteinDistance(a, b) {
-  const matrix = Array(b.length + 1).fill().map(() => Array(a.length + 1).fill(0));
-  for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
-  for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
-  for (let j = 1; j <= b.length; j++)
-    for (let i = 1; i <= a.length; i++)
-      matrix[j][i] = a[i - 1] === b[j - 1]
-        ? matrix[j - 1][i - 1]
-        : Math.min(matrix[j - 1][i], matrix[i][j - 1], matrix[j - 1][i - 1]) + 1;
-  return matrix[b.length][a.length];
+  const maxLen = Math.max(o.length, t.length);
+  let diffCount = 0;
+  for (let i = 0; i < Math.min(o.length, t.length); i++) {
+    if (o[i] !== t[i]) diffCount++;
+  }
+  diffCount += Math.abs(o.length - t.length);
+  const similarity = 1 - diffCount / maxLen;
+  return similarity > 0.85; // >85% совпадений → английский
 }
 
 // ========================= ИЗВЛЕЧЕНИЕ ТЕКСТА =========================
@@ -101,7 +93,7 @@ async function translate(text, detectedLang = 'auto') {
 
   const langCode = detectedLang.toLowerCase();
   if (SKIP_LANGS.includes(langCode)) {
-    if (DEBUG) console.log(`[SKIP LANG] Язык ${langCode} в списке пропуска`);
+    if (DEBUG) console.log(`[SKIP LANG] Язык ${langCode} пропущен`);
     return null;
   }
 
@@ -109,7 +101,7 @@ async function translate(text, detectedLang = 'auto') {
   if (CACHE.has(cacheKey)) {
     const cached = CACHE.get(cacheKey);
     if (cached === 'english') {
-      if (DEBUG) console.log('[CACHE ENGLISH] Уже определён как английский');
+      if (DEBUG) console.log('[CACHE ENGLISH]');
       return null;
     }
     if (DEBUG) console.log('[CACHE HIT]');
@@ -118,54 +110,49 @@ async function translate(text, detectedLang = 'auto') {
 
   let result = null;
 
-  // 1. DeepL
   if (DEEPL_KEY) {
     if (DEBUG) console.log('[TRY DEEPL]');
     result = await tryDeepL(text);
-    if (result) {
-      if (isProbablyEnglish(text, result.text)) {
-        if (DEBUG) console.log('[SKIP ENGLISH] DeepL вернул почти тот же текст');
-        CACHE.set(cacheKey, 'english');
-        return null;
-      }
-      CACHE.set(cacheKey, result);
-      return result;
-    }
-  }
-
-  // 2. Microsoft
-  if (MICROSOFT_KEY) {
-    if (DEBUG) console.log('[TRY MICROSOFT]');
-    result = await tryMicrosoft(text);
-    if (result) {
-      if (isProbablyEnglish(text, result.text)) {
-        if (DEBUG) console.log('[SKIP ENGLISH] Microsoft вернул почти тот же текст');
-        CACHE.set(cacheKey, 'english');
-        return null;
-      }
-      CACHE.set(cacheKey, result);
-      return result;
-    }
-  }
-
-  // 3. MyMemory
-  if (DEBUG) console.log('[TRY MYMEMORY]');
-  result = await tryMyMemory(text);
-  if (result) {
-    if (isProbablyEnglish(text, result.text)) {
-      if (DEBUG) console.log('[SKIP ENGLISH] MyMemory вернул почти тот же текст');
+    if (result && isProbablyEnglish(text, result.text)) {
+      if (DEBUG) console.log('[SKIP ENGLISH] DeepL вернул почти оригинал');
       CACHE.set(cacheKey, 'english');
       return null;
     }
+    if (result) {
+      CACHE.set(cacheKey, result);
+      return result;
+    }
+  }
+
+  if (MICROSOFT_KEY) {
+    if (DEBUG) console.log('[TRY MICROSOFT]');
+    result = await tryMicrosoft(text);
+    if (result && isProbablyEnglish(text, result.text)) {
+      if (DEBUG) console.log('[SKIP ENGLISH] Microsoft вернул почти оригинал');
+      CACHE.set(cacheKey, 'english');
+      return null;
+    }
+    if (result) {
+      CACHE.set(cacheKey, result);
+      return result;
+    }
+  }
+
+  if (DEBUG) console.log('[TRY MYMEMORY]');
+  result = await tryMyMemory(text);
+  if (result && isProbablyEnglish(text, result.text)) {
+    if (DEBUG) console.log('[SKIP ENGLISH] MyMemory вернул почти оригинал');
+    CACHE.set(cacheKey, 'english');
+    return null;
+  }
+  if (result) {
     CACHE.set(cacheKey, result);
     return result;
   }
 
-  if (DEBUG) console.log('[NO TRANSLATION] Ничего не сработало, но это может быть английский');
   return null;
 }
 
-// DeepL, Microsoft, MyMemory — без изменений (те же функции, что в прошлом сообщении)
 async function tryDeepL(text) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -238,8 +225,6 @@ async function tryMyMemory(text) {
   return null;
 }
 
-// ========================= НОТА И WEBHOOK =========================
-// (полностью тот же код, что был раньше — ничего не меняем)
 async function createNote(convId, translation) {
   try {
     await axiosInstance.post(
@@ -295,10 +280,7 @@ app.post('/intercom-webhook', async (req, res) => {
     if (DEBUG) console.log(`[TRANSLATE] ${wordCount} слов | Lang: ${intercomLang} | "${text.substring(0, 100)}"`);
 
     const translation = await translate(text, intercomLang);
-    if (!translation) {
-      // Больше никакого [FAIL] для английского!
-      return;
-    }
+    if (!translation) return;
 
     await createNote(convId, translation);
     console.log(`[SUCCESS] Переведено [${translation.sourceLang}→en] — ${convId}`);
@@ -309,7 +291,7 @@ app.post('/intercom-webhook', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v8 запущен! Английский больше не спамит логи`);
+  console.log(`Автопереводчик v8.1 запущен и готов!`);
   console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
   console.log(`→ Microsoft (westeurope): ${MICROSOFT_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
   console.log(`→ Порт: ${PORT}`);
