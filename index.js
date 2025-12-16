@@ -15,27 +15,27 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
 
-const DEEPL_KEY = process.env.DEEPL_KEY?.trim();                    // DeepL Free
-const MICROSOFT_KEY = process.env.MICROSOFT_KEY?.trim();            // Azure Translator (у тебя есть!)
-const MYMEMORY_KEY = process.env.MYMEMORY_KEY?.trim() || '';        // Опционально
+const DEEPL_KEY = process.env.DEEPL_KEY?.trim();
+const MICROSOFT_KEY = process.env.MICROSOFT_KEY?.trim();
+const MYMEMORY_KEY = process.env.MYMEMORY_KEY?.trim() || '';
 
 const ENABLED = process.env.ENABLED === 'true';
 const DEBUG = process.env.DEBUG === 'true';
 
-const TARGET_LANG = 'en';                                           // Для всех API
+const TARGET_LANG = 'en';
 const SKIP_LANGS = ['en', 'ru', 'uk'];
 const MIN_WORDS_FOR_TRANSLATION = 3;
 
 const INTERCOM_API_VERSION = '2.11';
 const INTERCOM_API_BASE = 'https://api.intercom.io';
 
-const CACHE = new NodeCache({ stdTTL: 4 * 3600, checkperiod: 600 });     // Кэш 4 часа
-const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });       // Антидубль 5 мин
+const CACHE = new NodeCache({ stdTTL: 4 * 3600, checkperiod: 600 });
+const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 
 const axiosInstance = axios.create({
   timeout: 15000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: { 'User-Agent': 'IntercomAutoTranslate/6.0' }
+  headers: { 'User-Agent': 'IntercomAutoTranslate/7.0' }
 });
 
 // ========================= УТИЛИТЫ =========================
@@ -90,21 +90,21 @@ async function translate(text, detectedLang = 'auto') {
 
   let result = null;
 
-  // 1. DeepL — лучший по качеству
+  // 1. DeepL
   if (DEEPL_KEY) {
     if (DEBUG) console.log('[TRY DEEPL]');
     result = await tryDeepL(text);
     if (result) return cacheResult(result);
   }
 
-  // 2. Microsoft Translator — отличный резерв (2M символов бесплатно!)
+  // 2. Microsoft Translator (с регионом westeurope)
   if (MICROSOFT_KEY) {
     if (DEBUG) console.log('[TRY MICROSOFT]');
     result = await tryMicrosoft(text);
     if (result) return cacheResult(result);
   }
 
-  // 3. MyMemory — всегда работает (даже без ключа)
+  // 3. MyMemory
   if (DEBUG) console.log('[TRY MYMEMORY]');
   result = await tryMyMemory(text);
   if (result) return cacheResult(result);
@@ -149,7 +149,7 @@ async function tryDeepL(text) {
   return null;
 }
 
-// Microsoft Translator
+// Microsoft Translator — ИСПРАВЛЕНО: добавлен регион westeurope
 async function tryMicrosoft(text) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -159,6 +159,7 @@ async function tryMicrosoft(text) {
         {
           headers: {
             'Ocp-Apim-Subscription-Key': MICROSOFT_KEY,
+            'Ocp-Apim-Subscription-Region': 'westeurope',  // ← Фикс ошибки 401
             'Content-Type': 'application/json'
           },
           timeout: 12000
@@ -281,9 +282,9 @@ app.post('/intercom-webhook', async (req, res) => {
 // ========================= ЗАПУСК =========================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v6 запущен!`);
+  console.log(`Автопереводчик v7 (с westeurope) запущен!`);
   console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
-  console.log(`→ Microsoft: ${MICROSOFT_KEY ? 'ВКЛ (2M символов бесплатно)' : 'ВЫКЛ'}`);
+  console.log(`→ Microsoft: ${MICROSOFT_KEY ? 'ВКЛ (регион westeurope)' : 'ВЫКЛ'}`);
   console.log(`→ MyMemory: ${MYMEMORY_KEY ? 'ВКЛ с ключом' : 'ВКЛ без ключа'}`);
   console.log(`→ Статус: ${ENABLED ? 'АКТИВЕН' : 'ВЫКЛЮЧЕН'}`);
   console.log(`→ Порт: ${PORT}`);
