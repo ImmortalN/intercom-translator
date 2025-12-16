@@ -14,34 +14,23 @@ app.use(bodyParser.json({ limit: '10mb' }));
 // ========================= CONFIG =========================
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
 const ADMIN_ID = process.env.ADMIN_ID;
-const MYMEMORY_KEY = process.env.MYMEMORY_KEY || ''; // Рекомендую зарегистрировать бесплатный ключ для большего лимита
+const DEEPL_KEY = process.env.DEEPL_KEY; // Обязательно! Получи на deepl.com
+const MYMEMORY_KEY = process.env.MYMEMORY_KEY || ''; // Опционально, для fallback
 const ENABLED = process.env.ENABLED === 'true';
 const DEBUG = process.env.DEBUG === 'true';
-const TARGET_LANG = 'en';
+const TARGET_LANG = 'EN-US'; // DeepL любит EN-US/EN-GB, но EN тоже работает
 const SKIP_LANGS = ['en', 'ru', 'uk'];
-const MIN_WORDS_FOR_TRANSLATION = 3; // Пропускаем короткие сообщения (спасибо, ок и т.д.)
+const MIN_WORDS_FOR_TRANSLATION = 3;
 const INTERCOM_API_VERSION = '2.11';
 const INTERCOM_API_BASE = 'https://api.intercom.io';
 
- // Актуальные живые публичные инстансы LibreTranslate (декабрь 2025)
-const LIBRE_INSTANCES = [
-  'https://libretranslate.com/translate',      // Основной официальный, часто работает
-  'https://translate.fedilab.app/translate',   // Медленный, но стабильный резерв
-  'https://lt.vern.cc/translate',              // Community, часто живой
-  'https://translate.namazitime.ru/translate', // Ещё один резерв
-  'https://translate.terraprint.co/translate'  // Старый, но иногда оживает
-];
-
-const CACHE = new NodeCache({ stdTTL: 4 * 3600, checkperiod: 600 }); // Кэш переводов 4 часа
-const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 }); // Антидубль 5 мин
+const CACHE = new NodeCache({ stdTTL: 4 * 3600, checkperiod: 600 });
+const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 
 const axiosInstance = axios.create({
   timeout: 15000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: {
-    'User-Agent': 'IntercomAutoTranslate/3.0',
-    'Accept': 'application/json'
-  }
+  headers: { 'User-Agent': 'IntercomAutoTranslate/4.0' }
 });
 
 // ========================= УТИЛИТЫ =========================
@@ -58,8 +47,7 @@ function cleanText(text = '') {
 function isGarbage(text = '') {
   if (!text) return true;
   const lower = text.toLowerCase();
-  return lower.includes('@@') || lower.includes('mainstre') || lower.includes('invalid') ||
-         lower.includes('mymemory') || lower.includes('example:');
+  return lower.includes('@@') || lower.includes('invalid') || lower.includes('error');
 }
 
 // ========================= ТЕКСТ =========================
@@ -81,17 +69,13 @@ function extractTextFromWebhook(conv, topic) {
 async function translate(text, detectedLang = 'auto') {
   if (text.length > 5000) text = text.substring(0, 5000);
 
-  // Пропуск известных языков
   const langCode = detectedLang.toLowerCase();
   if (SKIP_LANGS.includes(langCode)) {
-    if (DEBUG) console.log(`[SKIP LANG] Язык ${langCode} в skip-листе`);
+    if (DEBUG) console.log(`[SKIP LANG] ${langCode}`);
     return null;
   }
 
-  const isHebrew = /[\u0590-\u05FF]/.test(text);
-  const sourceLang = isHebrew ? 'he' : (langCode === 'auto' ? 'auto' : langCode);
-
-  const cacheKey = `tr:${sourceLang}:${text.substring(0, 150)}`;
+  const cacheKey = `tr:${langCode}:${text.substring(0, 150)}`;
   if (CACHE.has(cacheKey)) {
     if (DEBUG) console.log('[CACHE HIT]');
     return CACHE.get(cacheKey);
@@ -99,19 +83,21 @@ async function translate(text, detectedLang = 'auto') {
 
   let result = null;
 
-  // 1. LibreTranslate — пытаем все по порядку с retry
-  for (const url of LIBRE_INSTANCES) {
-    if (DEBUG) console.log(`[TRY LIBRE] ${url.split('/')[2]}`);
-    result = await tryLibre(text, sourceLang, url);
-    if (result) break;
+  // 1. DeepL — основной (лучшее качество)
+  if (DEEPL_KEY) {
+    if (DEBUG) console.log('[TRY DEEPL]');
+    result = await tryDeepL(text);
+    if (result) {
+      CACHE.set(cacheKey, result);
+      return result;
+    }
+  } else {
+    console.warn('DEEPL_KEY не задан — DeepL пропущен');
   }
 
   // 2. MyMemory fallback
-  if (!result) {
-    if (DEBUG) console.log('[TRY MYMEMORY]');
-    result = await tryMyMemory(text, sourceLang);
-  }
-
+  if (DEBUG) console.log('[TRY MYMEMORY]');
+  result = await tryMyMemory(text);
   if (result) {
     CACHE.set(cacheKey, result);
     return result;
@@ -121,40 +107,47 @@ async function translate(text, detectedLang = 'auto') {
   return null;
 }
 
-async function tryLibre(text, source, url) {
+async function tryDeepL(text) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
-      const res = await axiosInstance.post(url, {
-        q: text,
-        source,
-        target: 'en',
-        format: 'text'
-      }, { timeout: 12000 });
+      const res = await axiosInstance.post('https://api-free.deepl.com/v2/translate', null, {
+        params: {
+          auth_key: DEEPL_KEY,
+          text,
+          target_lang: TARGET_LANG.split('-')[0].toUpperCase(),
+          tag_handling: 'xml',
+          ignore_tags: 'a,url'
+        }
+      });
 
-      const translated = res.data?.translatedText?.trim() || res.data?.translation?.trim();
-      if (translated && translated !== text && translated.length > 3 && !isGarbage(translated)) {
-        return { text: translated, sourceLang: source === 'auto' ? 'detected' : source };
+      const translated = res.data?.translations?.[0]?.text?.trim();
+      const sourceLang = res.data?.translations?.[0]?.detected_source_language?.toLowerCase();
+
+      if (translated && translated !== text && !isGarbage(translated)) {
+        return { text: translated, sourceLang: sourceLang || 'auto' };
       }
     } catch (err) {
-      if (DEBUG) console.log(`[LIBRE ERROR] ${url.split('/')[2]} attempt ${attempt}: ${err.message} ${err.response?.status || ''}`);
-      if (attempt < 3) await new Promise(r => setTimeout(r, 2000 * attempt));
+      if (DEBUG) console.log(`[DEEPL ERROR] attempt ${attempt}: ${err.message} ${err.response?.status || ''}`);
+      if (err.response?.status === 429 || err.response?.status >= 500) {
+        await new Promise(r => setTimeout(r, 2000 * attempt));
+      }
     }
   }
   return null;
 }
 
-async function tryMyMemory(text, source) {
+async function tryMyMemory(text) {
+  // (тот же код, что был раньше — оставляю как резерв)
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const pair = source === 'he' ? 'he|en' : (source === 'auto' ? 'auto|en' : `${source}|en`);
       const res = await axiosInstance.get('https://api.mymemory.translated.net/get', {
-        params: { q: text, langpair: pair, key: MYMEMORY_KEY || undefined },
+        params: { q: text, langpair: 'auto|en', key: MYMEMORY_KEY || undefined },
         timeout: 10000
       });
 
       const translated = res.data.responseData?.translatedText?.trim();
-      if (translated && translated !== text && translated.length > 3 && !isGarbage(translated)) {
-        return { text: translated, sourceLang: source === 'auto' ? 'auto' : source };
+      if (translated && translated !== text && !isGarbage(translated)) {
+        return { text: translated, sourceLang: 'auto' };
       }
     } catch (err) {
       if (DEBUG) console.log(`[MYMEMORY ERROR] attempt ${attempt}: ${err.message}`);
@@ -163,7 +156,9 @@ async function tryMyMemory(text, source) {
   return null;
 }
 
-// ========================= НОТС =========================
+// ========================= НОТС + ХЕНДЛЕР =========================
+// (тот же код, что в предыдущей версии — работает отлично)
+
 async function createNote(convId, translation) {
   try {
     await axiosInstance.post(
@@ -186,7 +181,6 @@ async function createNote(convId, translation) {
   }
 }
 
-// ========================= ХЕНДЛЕР =========================
 app.get('/intercom-webhook', (_, res) => res.send('OK'));
 
 app.post('/intercom-webhook', async (req, res) => {
@@ -210,7 +204,6 @@ app.post('/intercom-webhook', async (req, res) => {
       return;
     }
 
-    // Антидубль
     const textHash = crypto.createHash('md5').update(text).digest('hex').slice(0, 8);
     const key = `${convId}:${textHash}`;
     if (PROCESSED.has(key)) return;
@@ -233,12 +226,10 @@ app.post('/intercom-webhook', async (req, res) => {
   }
 });
 
-// ========================= ЗАПУСК =========================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v3 запущен!`);
-  console.log(`→ Статус: ${ENABLED ? 'ВКЛЮЧЁН' : 'ВЫКЛЮЧЕН'}`);
-  console.log(`→ Порог: ${MIN_WORDS_FOR_TRANSLATION} слов`);
-  console.log(`→ Debug: ${DEBUG ? 'ВКЛ' : 'ВЫКЛ'}`);
+  console.log(`Автопереводчик v4 (DeepL) запущен!`);
+  console.log(`→ DeepL ключ: ${DEEPL_KEY ? 'ЗАДАН' : 'НЕ ЗАДАН — НЕ БУДЕТ РАБОТАТЬ!'}`);
+  console.log(`→ Статус: ${ENABLED ? 'ВКЛ' : 'ВЫКЛ'}`);
   console.log(`→ Порт: ${PORT}`);
 });
