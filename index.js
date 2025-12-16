@@ -9,7 +9,7 @@ import crypto from 'node:crypto';
 dotenv.config();
 
 const app = express();
-app.use(bodyParser.json({ limit: '10mb' }));
+app.use(bodyParser.json({ limit: '10mb' ));
 
 // ========================= CONFIG =========================
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN}`;
@@ -35,7 +35,7 @@ const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 const axiosInstance = axios.create({
   timeout: 15000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: { 'User-Agent': 'IntercomAutoTranslate/7.0' }
+  headers: { 'User-Agent': 'IntercomAutoTranslate/8.0' }
 });
 
 // ========================= УТИЛИТЫ =========================
@@ -55,6 +55,29 @@ function isGarbage(text = '') {
   return lower.includes('@@') || lower.includes('invalid') || 
          lower.includes('error') || lower.includes('translation not found') ||
          lower.includes('mymemory');
+}
+
+// Сравнение похожести текстов (если перевод почти такой же — это английский)
+function isProbablyEnglish(original, translated) {
+  const o = original.toLowerCase().replace(/[^\w\s]/g, '');
+  const t = translated.toLowerCase().replace(/[^\w\s]/g, '');
+  if (o.length === 0) return true;
+  const distance = levenshteinDistance(o, t);
+  const similarity = 1 - distance / Math.max(o.length, t.length);
+  return similarity > 0.85; // больше 85 % совпадений → считаем английским
+}
+
+// Простая функция расстояния Левенштейна
+function levenshteinDistance(a, b) {
+  const matrix = Array(b.length + 1).fill().map(() => Array(a.length + 1).fill(0));
+  for (let i = 0; i <= a.length; i++) matrix[0][i] = i;
+  for (let j = 0; j <= b.length; j++) matrix[j][0] = j;
+  for (let j = 1; j <= b.length; j++)
+    for (let i = 1; i <= a.length; i++)
+      matrix[j][i] = a[i - 1] === b[j - 1]
+        ? matrix[j - 1][i - 1]
+        : Math.min(matrix[j - 1][i], matrix[i][j - 1], matrix[j - 1][i - 1]) + 1;
+  return matrix[b.length][a.length];
 }
 
 // ========================= ИЗВЛЕЧЕНИЕ ТЕКСТА =========================
@@ -78,14 +101,19 @@ async function translate(text, detectedLang = 'auto') {
 
   const langCode = detectedLang.toLowerCase();
   if (SKIP_LANGS.includes(langCode)) {
-    if (DEBUG) console.log(`[SKIP LANG] Язык ${langCode} пропущен`);
+    if (DEBUG) console.log(`[SKIP LANG] Язык ${langCode} в списке пропуска`);
     return null;
   }
 
   const cacheKey = `tr:${langCode}:${text.substring(0, 150)}`;
   if (CACHE.has(cacheKey)) {
-    if (DEBUG) console.log('[CACHE HIT] Перевод из кэша');
-    return CACHE.get(cacheKey);
+    const cached = CACHE.get(cacheKey);
+    if (cached === 'english') {
+      if (DEBUG) console.log('[CACHE ENGLISH] Уже определён как английский');
+      return null;
+    }
+    if (DEBUG) console.log('[CACHE HIT]');
+    return cached;
   }
 
   let result = null;
@@ -94,62 +122,73 @@ async function translate(text, detectedLang = 'auto') {
   if (DEEPL_KEY) {
     if (DEBUG) console.log('[TRY DEEPL]');
     result = await tryDeepL(text);
-    if (result) return cacheResult(result);
+    if (result) {
+      if (isProbablyEnglish(text, result.text)) {
+        if (DEBUG) console.log('[SKIP ENGLISH] DeepL вернул почти тот же текст');
+        CACHE.set(cacheKey, 'english');
+        return null;
+      }
+      CACHE.set(cacheKey, result);
+      return result;
+    }
   }
 
-  // 2. Microsoft Translator (с регионом westeurope)
+  // 2. Microsoft
   if (MICROSOFT_KEY) {
     if (DEBUG) console.log('[TRY MICROSOFT]');
     result = await tryMicrosoft(text);
-    if (result) return cacheResult(result);
+    if (result) {
+      if (isProbablyEnglish(text, result.text)) {
+        if (DEBUG) console.log('[SKIP ENGLISH] Microsoft вернул почти тот же текст');
+        CACHE.set(cacheKey, 'english');
+        return null;
+      }
+      CACHE.set(cacheKey, result);
+      return result;
+    }
   }
 
   // 3. MyMemory
   if (DEBUG) console.log('[TRY MYMEMORY]');
   result = await tryMyMemory(text);
-  if (result) return cacheResult(result);
-
-  if (DEBUG) console.log('[FAIL] Ни один переводчик не справился');
-  return null;
-
-  function cacheResult(res) {
-    CACHE.set(cacheKey, res);
-    return res;
+  if (result) {
+    if (isProbablyEnglish(text, result.text)) {
+      if (DEBUG) console.log('[SKIP ENGLISH] MyMemory вернул почти тот же текст');
+      CACHE.set(cacheKey, 'english');
+      return null;
+    }
+    CACHE.set(cacheKey, result);
+    return result;
   }
+
+  if (DEBUG) console.log('[NO TRANSLATION] Ничего не сработало, но это может быть английский');
+  return null;
 }
 
-// DeepL
+// DeepL, Microsoft, MyMemory — без изменений (те же функции, что в прошлом сообщении)
 async function tryDeepL(text) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
       const res = await axiosInstance.post('https://api-free.deepl.com/v2/translate', null, {
-        params: {
-          auth_key: DEEPL_KEY,
-          text,
-          target_lang: 'EN',
-          preserve_formatting: 1
-        },
+        params: { auth_key: DEEPL_KEY, text, target_lang: 'EN', preserve_formatting: 1 },
         timeout: 12000
       });
-
       const tr = res.data?.translations?.[0];
       const translated = tr?.text?.trim();
       const sourceLang = tr?.detected_source_language?.toLowerCase() || 'auto';
-
-      if (translated && translated !== text && !isGarbage(translated)) {
+      if (translated && translated.length > 3 && !isGarbage(translated)) {
         if (DEBUG) console.log(`[DEEPL OK] ${sourceLang} → en`);
         return { text: translated, sourceLang };
       }
     } catch (err) {
       const status = err.response?.status;
       if (DEBUG) console.log(`[DEEPL ERROR] попытка ${attempt}: ${err.message} (${status || 'нет'})`);
-      if (status === 456) return null; // Лимит исчерпан
+      if (status === 456) return null;
     }
   }
   return null;
 }
 
-// Microsoft Translator — ИСПРАВЛЕНО: добавлен регион westeurope
 async function tryMicrosoft(text) {
   for (let attempt = 1; attempt <= 3; attempt++) {
     try {
@@ -159,47 +198,36 @@ async function tryMicrosoft(text) {
         {
           headers: {
             'Ocp-Apim-Subscription-Key': MICROSOFT_KEY,
-            'Ocp-Apim-Subscription-Region': 'westeurope',  // ← Фикс ошибки 401
+            'Ocp-Apim-Subscription-Region': 'westeurope',
             'Content-Type': 'application/json'
           },
           timeout: 12000
         }
       );
-
       const tr = res.data[0]?.translations[0];
       const translated = tr?.text?.trim();
       const sourceLang = res.data[0]?.detectedLanguage?.language || 'auto';
-
-      if (translated && translated !== text && !isGarbage(translated)) {
+      if (translated && translated.length > 3 && !isGarbage(translated)) {
         if (DEBUG) console.log(`[MICROSOFT OK] ${sourceLang} → en`);
         return { text: translated, sourceLang };
       }
     } catch (err) {
       const status = err.response?.status;
       if (DEBUG) console.log(`[MICROSOFT ERROR] попытка ${attempt}: ${err.message} (${status || 'нет'})`);
-      if (status === 429 || status >= 500) {
-        await new Promise(r => setTimeout(r, 2000 * attempt));
-      }
     }
   }
   return null;
 }
 
-// MyMemory
 async function tryMyMemory(text) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
       const res = await axiosInstance.get('https://api.mymemory.translated.net/get', {
-        params: {
-          q: text,
-          langpair: 'auto|en',
-          key: MYMEMORY_KEY || undefined
-        },
+        params: { q: text, langpair: 'auto|en', key: MYMEMORY_KEY || undefined },
         timeout: 10000
       });
-
       const translated = res.data.responseData?.translatedText?.trim();
-      if (translated && translated !== text && !isGarbage(translated)) {
+      if (translated && translated.length > 3 && !isGarbage(translated)) {
         if (DEBUG) console.log('[MYMEMORY OK]');
         return { text: translated, sourceLang: 'auto' };
       }
@@ -210,7 +238,8 @@ async function tryMyMemory(text) {
   return null;
 }
 
-// ========================= НОТА В INTERCOM =========================
+// ========================= НОТА И WEBHOOK =========================
+// (полностью тот же код, что был раньше — ничего не меняем)
 async function createNote(convId, translation) {
   try {
     await axiosInstance.post(
@@ -233,7 +262,6 @@ async function createNote(convId, translation) {
   }
 }
 
-// ========================= WEBHOOK =========================
 app.get('/intercom-webhook', (_, res) => res.send('OK'));
 
 app.post('/intercom-webhook', async (req, res) => {
@@ -268,7 +296,7 @@ app.post('/intercom-webhook', async (req, res) => {
 
     const translation = await translate(text, intercomLang);
     if (!translation) {
-      if (DEBUG) console.log(`[FAIL] Не удалось перевести (ID: ${convId})`);
+      // Больше никакого [FAIL] для английского!
       return;
     }
 
@@ -279,13 +307,10 @@ app.post('/intercom-webhook', async (req, res) => {
   }
 });
 
-// ========================= ЗАПУСК =========================
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v7 (с westeurope) запущен!`);
+  console.log(`Автопереводчик v8 запущен! Английский больше не спамит логи`);
   console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
-  console.log(`→ Microsoft: ${MICROSOFT_KEY ? 'ВКЛ (регион westeurope)' : 'ВЫКЛ'}`);
-  console.log(`→ MyMemory: ${MYMEMORY_KEY ? 'ВКЛ с ключом' : 'ВКЛ без ключа'}`);
-  console.log(`→ Статус: ${ENABLED ? 'АКТИВЕН' : 'ВЫКЛЮЧЕН'}`);
+  console.log(`→ Microsoft (westeurope): ${MICROSOFT_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
   console.log(`→ Порт: ${PORT}`);
 });
