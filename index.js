@@ -5,7 +5,7 @@ import http from 'http';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
 import crypto from 'node:crypto';
-import { franc } from 'franc';  // npm i franc
+import { franc } from 'franc';
 
 dotenv.config();
 
@@ -16,10 +16,9 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN?.trim()}`;
 const ADMIN_ID = process.env.ADMIN_ID?.trim();
 const DEEPL_KEY = process.env.DEEPL_KEY?.trim();
-const MICROSOFT_KEY = process.env.MICROSOFT_KEY?.trim();
-const MICROSOFT_REGION = process.env.MICROSOFT_REGION?.trim() || 'westeurope';
-const MYMEMORY_KEY = process.env.MYMEMORY_KEY?.trim();       // платный ключ, если есть
-const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL?.trim();   // для бесплатного лимита 50k/день
+const LIBRE_KEY = process.env.LIBRE_KEY?.trim();              // опционально с portal.libretranslate.com
+const MYMEMORY_KEY = process.env.MYMEMORY_KEY?.trim();
+const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL?.trim();
 
 const ENABLED = process.env.ENABLED === 'true';
 const DEBUG = process.env.DEBUG === 'true';
@@ -35,8 +34,17 @@ const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 const axiosInstance = axios.create({
   timeout: 15000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: { 'User-Agent': 'IntercomAutoTranslate/8.3' }
+  headers: { 'User-Agent': 'IntercomAutoTranslate/8.5' }
 });
+
+// LibreTranslate публичные инстансы (актуальные на февраль 2026)
+const LIBRE_APIS = [
+  { url: 'https://libretranslate.com/translate', key: LIBRE_KEY || '' },          // официальный, с ключом выше лимит
+  { url: 'https://libretranslate.de/translate', key: '' },                       // стабильный европейский
+  { url: 'https://translate.argosopentech.com/translate', key: '' },             // основной публичный
+  { url: 'https://translate.terraprint.co/translate', key: '' }                  // ещё один надёжный
+  // Можно добавить: 'https://libretranslate.pussthecat.org/translate' и т.д.
+];
 
 // ========================= УТИЛИТЫ =========================
 function cleanText(text = '') {
@@ -70,7 +78,6 @@ function isProbablyEnglish(original, translated) {
   return similarity > 0.88;
 }
 
-// ========================= ИЗВЛЕЧЕНИЕ + ОПРЕДЕЛЕНИЕ ЯЗЫКА =========================
 function extractTextFromWebhook(conv, topic) {
   let body = '';
   if (topic === 'conversation.user.created' && conv.source?.body) {
@@ -112,13 +119,12 @@ async function translate(text, preferredLang = 'auto') {
 
   let result = null;
 
-  // 1. DeepL (теперь с правильным заголовком — обязательно!)
+  // 1. DeepL (лучшее качество)
   if (DEEPL_KEY) {
     if (DEBUG) console.log('[TRY DEEPL]');
     result = await tryDeepL(text);
     if (result) {
       if (isProbablyEnglish(text, result.text)) {
-        if (DEBUG) console.log('[SKIP ENGLISH] DeepL вернул почти оригинал');
         CACHE.set(cacheKey, 'english');
         return null;
       }
@@ -127,27 +133,23 @@ async function translate(text, preferredLang = 'auto') {
     }
   }
 
-  // 2. Microsoft
-  if (MICROSOFT_KEY) {
-    if (DEBUG) console.log('[TRY MICROSOFT]');
-    result = await tryMicrosoft(text);
-    if (result) {
-      if (isProbablyEnglish(text, result.text)) {
-        if (DEBUG) console.log('[SKIP ENGLISH] Microsoft вернул почти оригинал');
-        CACHE.set(cacheKey, 'english');
-        return null;
-      }
-      CACHE.set(cacheKey, result);
-      return result;
+  // 2. LibreTranslate (несколько инстансов для надёжности)
+  if (DEBUG) console.log('[TRY LIBRETRANSLATE]');
+  result = await tryLibreTranslate(text, langCode);
+  if (result) {
+    if (isProbablyEnglish(text, result.text)) {
+      CACHE.set(cacheKey, 'english');
+      return null;
     }
+    CACHE.set(cacheKey, result);
+    return result;
   }
 
-  // 3. MyMemory
+  // 3. MyMemory (последний резерв)
   if (DEBUG) console.log('[TRY MYMEMORY]');
   result = await tryMyMemory(text);
   if (result) {
     if (isProbablyEnglish(text, result.text)) {
-      if (DEBUG) console.log('[SKIP ENGLISH] MyMemory вернул почти оригинал');
       CACHE.set(cacheKey, 'english');
       return null;
     }
@@ -174,44 +176,40 @@ async function tryDeepL(text) {
     const tr = res.data?.translations?.[0];
     const translated = tr?.text?.trim();
     if (translated && translated.length > 3 && !isGarbage(translated)) {
-      const src = tr?.detected_source_language?.toLowerCase() || 'auto';
+      const src = tr?.detected_source_language?.toLowerCase() || detectLanguageFallback(text);
       if (DEBUG) console.log(`[DEEPL OK] ${src} → en`);
       return { text: translated, sourceLang: src };
     }
   } catch (err) {
-    const status = err.response?.status;
-    if (DEBUG) console.log(`[DEEPL ERR] ${err.message} (${status || 'нет'})`);
-    if (status === 456) console.log('[DEEPL] Квота исчерпана — месяц подождать');
+    if (DEBUG) console.log(`[DEEPL ERR] ${err.message} (${err.response?.status || 'нет'})`);
   }
   return null;
 }
 
-async function tryMicrosoft(text) {
-  try {
-    const res = await axiosInstance.post(
-      `https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en`,
-      [{ Text: text }],
-      {
-        headers: {
-          'Ocp-Apim-Subscription-Key': MICROSOFT_KEY,
-          'Ocp-Apim-Subscription-Region': MICROSOFT_REGION,
-          'Content-Type': 'application/json'
-        }
-      }
-    );
+async function tryLibreTranslate(text, sourceLang) {
+  for (const instance of LIBRE_APIS) {
+    try {
+      const body = {
+        q: text,
+        source: sourceLang === 'auto' ? 'auto' : sourceLang,
+        target: 'en',
+        format: 'text'
+      };
+      if (instance.key) body.api_key = instance.key;
 
-    const tr = res.data?.[0]?.translations?.[0];
-    const translated = tr?.text?.trim();
-    if (translated && translated.length > 3 && !isGarbage(translated)) {
-      const src = res.data[0]?.detectedLanguage?.language?.toLowerCase() || 'auto';
-      if (DEBUG) console.log(`[MICROSOFT OK] ${src} → en`);
-      return { text: translated, sourceLang: src };
+      const res = await axiosInstance.post(instance.url, body, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      const translated = res.data?.translatedText?.trim() || res.data?.translation?.trim();
+      if (translated && translated.length > 3 && !isGarbage(translated)) {
+        const src = res.data?.detectedLanguage?.language?.toLowerCase() || sourceLang;
+        if (DEBUG) console.log(`[LIBRE OK] ${instance.url.split('//')[1].split('/')[0]} | ${src} → en`);
+        return { text: translated, sourceLang: src };
+      }
+    } catch (err) {
+      if (DEBUG) console.log(`[LIBRE ERR] ${instance.url} → ${err.message}`);
     }
-  } catch (err) {
-    const status = err.response?.status;
-    if (DEBUG) console.log(`[MICROSOFT ERR] ${err.message} (${status || 'нет'})`);
-    if (status === 401) console.log('[MICROSOFT] 401 — проверь ключ и регион в Azure Portal');
-    if (status === 429) console.log('[MICROSOFT] 429 — rate limit, подожди 5–10 мин');
   }
   return null;
 }
@@ -222,30 +220,22 @@ async function tryMyMemory(text) {
 
     if (MYMEMORY_KEY) {
       params.key = MYMEMORY_KEY;
-      if (DEBUG) console.log('[MYMEMORY] Используем платный key');
     } else if (MYMEMORY_EMAIL) {
       params.de = MYMEMORY_EMAIL;
-      if (DEBUG) console.log('[MYMEMORY] Используем email для повышенного лимита');
-    } else {
-      if (DEBUG) console.log('[MYMEMORY] Анонимный режим — лимит очень низкий');
     }
 
     const res = await axiosInstance.get('https://api.mymemory.translated.net/get', { params });
-
     const translated = res.data?.responseData?.translatedText?.trim();
     if (translated && translated.length > 3 && !isGarbage(translated)) {
       if (DEBUG) console.log('[MYMEMORY OK]');
       return { text: translated, sourceLang: 'auto' };
     }
   } catch (err) {
-    const status = err.response?.status;
-    if (DEBUG) console.log(`[MYMEMORY ERR] ${err.message} (${status || 'нет'})`);
-    if (status === 429) console.log('[MYMEMORY] 429 — дневной лимит исчерпан, новая почта или подожди до завтра');
+    if (DEBUG) console.log(`[MYMEMORY ERR] ${err.message} (${err.response?.status || 'нет'})`);
   }
   return null;
 }
 
-// ========================= СОЗДАНИЕ NOTE =========================
 async function createNote(convId, translation) {
   try {
     await axiosInstance.post(
@@ -312,9 +302,9 @@ app.post('/intercom-webhook', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v8.3 запущен`);
-  console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ (новый auth)' : 'ВЫКЛ'}`);
-  console.log(`→ Microsoft (${MICROSOFT_REGION}): ${MICROSOFT_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
+  console.log(`Автопереводчик v8.5 запущен (DeepL + Libre + MyMemory)`);
+  console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ (500k free)' : 'ВЫКЛ'}`);
+  console.log(`→ LibreTranslate: ${LIBRE_APIS.length} инстансов (key: ${LIBRE_KEY ? 'есть' : 'нет'})`);
   console.log(`→ MyMemory: ${MYMEMORY_KEY ? 'с ключом' : MYMEMORY_EMAIL ? 'с email' : 'анонимно'}`);
   console.log(`→ Порт: ${PORT}`);
 });
