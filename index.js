@@ -158,23 +158,26 @@ async function translate(text, preferredLang = 'auto') {
 async function tryDeepL(text) {
   for (let attempt = 1; attempt <= 2; attempt++) {
     try {
-      const res = await axiosInstance.post('https://api-free.deepl.com/v2/translate', null, {
-        params: {
-          auth_key: DEEPL_KEY,
-          text,
-          target_lang: 'EN',
-          preserve_formatting: 1
+      const res = await axiosInstance.post('https://api-free.deepl.com/v2/translate', {
+        text: [text],  // теперь в body как массив
+        target_lang: 'EN',
+        preserve_formatting: true
+      }, {
+        headers: {
+          'Authorization': `DeepL-Auth-Key ${DEEPL_KEY}`,
+          'Content-Type': 'application/json'
         }
       });
       const tr = res.data?.translations?.[0];
       const translated = tr?.text?.trim();
       if (translated && translated.length > 3 && !isGarbage(translated)) {
+        if (DEBUG) console.log(`[DEEPL OK] ${tr?.detected_source_language?.toLowerCase() || 'auto'} → en`);
         return { text: translated, sourceLang: tr?.detected_source_language?.toLowerCase() || 'auto' };
       }
     } catch (err) {
       const status = err.response?.status;
       if (DEBUG) console.log(`[DEEPL ERR] attempt ${attempt}: ${err.message} (${status})`);
-      if (status === 456) return null; // квота кончилась — дальше не пытаться
+      if (status === 456) return null; // квота
       if (status === 429) await new Promise(r => setTimeout(r, 2000 * attempt));
     }
   }
