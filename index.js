@@ -16,7 +16,6 @@ app.use(bodyParser.json({ limit: '10mb' }));
 const INTERCOM_TOKEN = `Bearer ${process.env.INTERCOM_TOKEN?.trim()}`;
 const ADMIN_ID = process.env.ADMIN_ID?.trim();
 const DEEPL_KEY = process.env.DEEPL_KEY?.trim();
-const LIBRE_KEY = process.env.LIBRE_KEY?.trim();              // опционально с portal.libretranslate.com
 const MYMEMORY_KEY = process.env.MYMEMORY_KEY?.trim();
 const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL?.trim();
 
@@ -34,16 +33,16 @@ const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 const axiosInstance = axios.create({
   timeout: 15000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: { 'User-Agent': 'IntercomAutoTranslate/8.5' }
+  headers: { 'User-Agent': 'IntercomAutoTranslate/8.6' }
 });
 
-// LibreTranslate публичные инстансы (актуальные на февраль 2026)
+// Только публичные инстансы БЕЗ API key (актуально на февраль 2026)
 const LIBRE_APIS = [
-  { url: 'https://libretranslate.com/translate', key: LIBRE_KEY || '' },          // официальный, с ключом выше лимит
-  { url: 'https://libretranslate.de/translate', key: '' },                       // стабильный европейский
-  { url: 'https://translate.argosopentech.com/translate', key: '' },             // основной публичный
-  { url: 'https://translate.terraprint.co/translate', key: '' }                  // ещё один надёжный
-  // Можно добавить: 'https://libretranslate.pussthecat.org/translate' и т.д.
+  'https://translate.argosopentech.com/translate',      // основной публичный, без ключа
+  'https://translate.terraprint.co/translate',          // стабильный
+  'https://libretranslate.de/translate',                // европейский зеркало
+  // 'https://translate.foxhaven.cyou/translate',       // если живой — добавь
+  // 'https://trans.zillyhuhn.com/translate'            // иногда работает, но может требовать ключ
 ];
 
 // ========================= УТИЛИТЫ =========================
@@ -119,7 +118,7 @@ async function translate(text, preferredLang = 'auto') {
 
   let result = null;
 
-  // 1. DeepL (лучшее качество)
+  // 1. DeepL
   if (DEEPL_KEY) {
     if (DEBUG) console.log('[TRY DEEPL]');
     result = await tryDeepL(text);
@@ -133,7 +132,7 @@ async function translate(text, preferredLang = 'auto') {
     }
   }
 
-  // 2. LibreTranslate (несколько инстансов для надёжности)
+  // 2. LibreTranslate публичные (без ключа)
   if (DEBUG) console.log('[TRY LIBRETRANSLATE]');
   result = await tryLibreTranslate(text, langCode);
   if (result) {
@@ -145,7 +144,7 @@ async function translate(text, preferredLang = 'auto') {
     return result;
   }
 
-  // 3. MyMemory (последний резерв)
+  // 3. MyMemory
   if (DEBUG) console.log('[TRY MYMEMORY]');
   result = await tryMyMemory(text);
   if (result) {
@@ -187,7 +186,7 @@ async function tryDeepL(text) {
 }
 
 async function tryLibreTranslate(text, sourceLang) {
-  for (const instance of LIBRE_APIS) {
+  for (const url of LIBRE_APIS) {
     try {
       const body = {
         q: text,
@@ -195,20 +194,20 @@ async function tryLibreTranslate(text, sourceLang) {
         target: 'en',
         format: 'text'
       };
-      if (instance.key) body.api_key = instance.key;
+      // НЕ добавляем api_key — эти инстансы работают без него
 
-      const res = await axiosInstance.post(instance.url, body, {
+      const res = await axiosInstance.post(url, body, {
         headers: { 'Content-Type': 'application/json' }
       });
 
       const translated = res.data?.translatedText?.trim() || res.data?.translation?.trim();
       if (translated && translated.length > 3 && !isGarbage(translated)) {
         const src = res.data?.detectedLanguage?.language?.toLowerCase() || sourceLang;
-        if (DEBUG) console.log(`[LIBRE OK] ${instance.url.split('//')[1].split('/')[0]} | ${src} → en`);
+        if (DEBUG) console.log(`[LIBRE OK] ${url.split('//')[1].split('/')[0]} | ${src} → en`);
         return { text: translated, sourceLang: src };
       }
     } catch (err) {
-      if (DEBUG) console.log(`[LIBRE ERR] ${instance.url} → ${err.message}`);
+      if (DEBUG) console.log(`[LIBRE ERR] ${url} → ${err.message} (${err.response?.status || 'нет'})`);
     }
   }
   return null;
@@ -302,9 +301,9 @@ app.post('/intercom-webhook', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v8.5 запущен (DeepL + Libre + MyMemory)`);
+  console.log(`Автопереводчик v8.6 запущен (DeepL + публичные Libre без ключа + MyMemory)`);
   console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ (500k free)' : 'ВЫКЛ'}`);
-  console.log(`→ LibreTranslate: ${LIBRE_APIS.length} инстансов (key: ${LIBRE_KEY ? 'есть' : 'нет'})`);
+  console.log(`→ LibreTranslate: ${LIBRE_APIS.length} публичных зеркал (без ключа)`);
   console.log(`→ MyMemory: ${MYMEMORY_KEY ? 'с ключом' : MYMEMORY_EMAIL ? 'с email' : 'анонимно'}`);
   console.log(`→ Порт: ${PORT}`);
 });
