@@ -42,7 +42,6 @@ const LINGVA_BASES = [
   'https://translate.ploud.jp/api/v1',
   'https://lingva.garudalinux.org/api/v1',
   'https://lingva.lunar.icu/api/v1'
-  // добавь новые из https://github.com/thedaviddelta/lingva-translate#instances
 ];
 
 // LibreTranslate публичные (без ключа)
@@ -52,8 +51,59 @@ const LIBRE_APIS = [
   'https://libretranslate.de/translate'
 ];
 
+// Переменная для экспоненциального backoff Google GTX
+let gtxBackoff = 1500; // начальная пауза 1.5 секунды
+
 // ========================= УТИЛИТЫ =========================
-// cleanText, isGarbage, isProbablyEnglish, extractTextFromWebhook, detectLanguageFallback — оставляем как есть
+function cleanText(text = '') {
+  if (!text) return '';
+  return text
+    .replace(/<br\s*\/?>/gi, '\n')
+    .replace(/<\/?[^>]+>/g, ' ')
+    .replace(/https?:\/\/\S+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function isGarbage(text = '') {
+  if (!text) return true;
+  const lower = text.toLowerCase();
+  return lower.includes('@@') || lower.includes('invalid') ||
+         lower.includes('error') || lower.includes('translation not found') ||
+         lower.includes('mymemory');
+}
+
+function isProbablyEnglish(original, translated) {
+  const o = original.toLowerCase().replace(/[^\w\s]/g, '');
+  const t = translated.toLowerCase().replace(/[^\w\s]/g, '');
+  if (o.length < 5 || t.length < 5) return false;
+  const maxLen = Math.max(o.length, t.length);
+  let diffCount = Math.abs(o.length - t.length);
+  for (let i = 0; i < Math.min(o.length, t.length); i++) {
+    if (o[i] !== t[i]) diffCount++;
+  }
+  const similarity = 1 - diffCount / maxLen;
+  return similarity > 0.88;
+}
+
+function extractTextFromWebhook(conv, topic) {
+  let body = '';
+  if (topic === 'conversation.user.created' && conv.source?.body) {
+    body = conv.source.body;
+  } else {
+    const parts = conv.conversation_parts?.conversation_parts || [];
+    const lastUserPart = parts
+      .filter(p => ['user', 'contact', 'lead'].includes(p.author?.type) && p.body)
+      .sort((a, b) => (b.created_at || 0) - (a.created_at || 0))[0];
+    body = lastUserPart?.body || '';
+  }
+  return cleanText(body);
+}
+
+function detectLanguageFallback(text) {
+  const code = franc(text, { minLength: 4 });
+  return code === 'und' ? 'auto' : (code === 'eng' ? 'en' : code.slice(0, 2));
+}
 
 // ========================= ПЕРЕВОД =========================
 async function translate(text, preferredLang = 'auto') {
@@ -84,12 +134,12 @@ async function translate(text, preferredLang = 'auto') {
     if (result) return finalizeResult(result, text, cacheKey);
   }
 
-  // 2. Lingva Translate (первый fallback по твоему желанию)
+  // 2. Lingva Translate
   if (DEBUG) console.log('[TRY LINGVA]');
   result = await tryLingva(text, langCode);
   if (result) return finalizeResult(result, text, cacheKey);
 
-  // 3. Google Translate unofficial gtx (второй fallback)
+  // 3. Google Translate unofficial gtx (с экспоненциальным backoff)
   if (DEBUG) console.log('[TRY GOOGLE GTX]');
   result = await tryGoogleGTX(text, langCode);
   if (result) return finalizeResult(result, text, cacheKey);
@@ -116,7 +166,31 @@ function finalizeResult(result, text, cacheKey) {
   return result;
 }
 
-// tryDeepL — без изменений
+async function tryDeepL(text) {
+  try {
+    const res = await axiosInstance.post('https://api-free.deepl.com/v2/translate', {
+      text: [text],
+      target_lang: 'EN',
+      preserve_formatting: true
+    }, {
+      headers: {
+        'Authorization': `DeepL-Auth-Key ${DEEPL_KEY}`,
+        'Content-Type': 'application/json'
+      }
+    });
+
+    const tr = res.data?.translations?.[0];
+    const translated = tr?.text?.trim();
+    if (translated && translated.length > 3 && !isGarbage(translated)) {
+      const src = tr?.detected_source_language?.toLowerCase() || detectLanguageFallback(text);
+      if (DEBUG) console.log(`[DEEPL OK] ${src} → en`);
+      return { text: translated, sourceLang: src };
+    }
+  } catch (err) {
+    if (DEBUG) console.log(`[DEEPL ERR] ${err.message} (${err.response?.status || 'нет'})`);
+  }
+  return null;
+}
 
 async function tryLingva(text, sourceLang) {
   for (const base of LINGVA_BASES) {
@@ -140,14 +214,15 @@ async function tryLingva(text, sourceLang) {
 
 async function tryGoogleGTX(text, sourceLang) {
   try {
-    // Пауза, чтобы снизить риск бана IP
-    await new Promise(r => setTimeout(r, 1500 + Math.random() * 1000)); // 1.5–2.5 сек
+    // Экспоненциальный backoff
+    await new Promise(r => setTimeout(r, gtxBackoff));
 
     const sl = sourceLang === 'auto' ? 'auto' : sourceLang;
     const url = `https://translate.googleapis.com/translate_a/single?client=gtx&dt=t&sl=${sl}&tl=en&q=${encodeURIComponent(text)}`;
 
     const res = await axiosInstance.get(url);
-    // Структура ответа gtx: [ [[translated, original, ...]], null, detected_lang, ... ]
+
+    // Парсинг ответа gtx
     const translatedParts = res.data?.[0] || [];
     let translated = '';
     translatedParts.forEach(part => { if (part[0]) translated += part[0]; });
@@ -156,25 +231,140 @@ async function tryGoogleGTX(text, sourceLang) {
     const detected = res.data?.[2] || sourceLang;
 
     if (translated && translated.length > 3) {
-      if (DEBUG) console.log(`[GOOGLE GTX OK] ${detected} → en`);
+      if (DEBUG) console.log(`[GOOGLE GTX OK] ${detected} → en | backoff был ${gtxBackoff} мс`);
+      gtxBackoff = 1500; // сбрасываем после успеха
       return { text: translated, sourceLang: detected.toLowerCase() };
     }
   } catch (err) {
-    if (DEBUG) console.log(`[GOOGLE GTX ERR] ${err.message} (${err.response?.status || ''})`);
+    const status = err.response?.status;
+    if (status === 429 || status === 503) {
+      gtxBackoff = Math.min(gtxBackoff * 2, 10000); // удваиваем, макс 10 сек
+      if (DEBUG) console.log(`[GOOGLE GTX] Rate limit, увеличиваем паузу до ${gtxBackoff} мс`);
+    }
+    if (DEBUG) console.log(`[GOOGLE GTX ERR] ${err.message} (${status || ''})`);
   }
   return null;
 }
 
-// tryLibreTranslate и tryMyMemory — без изменений
+async function tryLibreTranslate(text, sourceLang) {
+  for (const url of LIBRE_APIS) {
+    try {
+      const body = {
+        q: text,
+        source: sourceLang === 'auto' ? 'auto' : sourceLang,
+        target: 'en',
+        format: 'text'
+      };
 
-// createNote, webhook handler, app.listen — без изменений, только обнови версию в логах
+      const res = await axiosInstance.post(url, body, {
+        headers: { 'Content-Type': 'application/json' }
+      });
+
+      const translated = res.data?.translatedText?.trim() || res.data?.translation?.trim();
+      if (translated && translated.length > 3 && !isGarbage(translated)) {
+        const src = res.data?.detectedLanguage?.language?.toLowerCase() || sourceLang;
+        if (DEBUG) console.log(`[LIBRE OK] ${url.split('//')[1].split('/')[0]} | ${src} → en`);
+        return { text: translated, sourceLang: src };
+      }
+    } catch (err) {
+      if (DEBUG) console.log(`[LIBRE ERR] ${url} → ${err.message} (${err.response?.status || ''})`);
+    }
+  }
+  return null;
+}
+
+async function tryMyMemory(text) {
+  try {
+    const params = { q: text, langpair: 'auto|en' };
+
+    if (MYMEMORY_KEY) {
+      params.key = MYMEMORY_KEY;
+    } else if (MYMEMORY_EMAIL) {
+      params.de = MYMEMORY_EMAIL;
+    }
+
+    const res = await axiosInstance.get('https://api.mymemory.translated.net/get', { params });
+    const translated = res.data?.responseData?.translatedText?.trim();
+    if (translated && translated.length > 3 && !isGarbage(translated)) {
+      if (DEBUG) console.log('[MYMEMORY OK]');
+      return { text: translated, sourceLang: 'auto' };
+    }
+  } catch (err) {
+    if (DEBUG) console.log(`[MYMEMORY ERR] ${err.message} (${err.response?.status || ''})`);
+  }
+  return null;
+}
+
+async function createNote(convId, translation) {
+  try {
+    await axiosInstance.post(
+      `${INTERCOM_API_BASE}/conversations/${convId}/reply`,
+      {
+        message_type: 'note',
+        admin_id: ADMIN_ID,
+        body: `Auto-translation (${translation.sourceLang} → en):\n${translation.text}`
+      },
+      {
+        headers: {
+          Authorization: INTERCOM_TOKEN,
+          'Intercom-Version': INTERCOM_API_VERSION,
+          'Content-Type': 'application/json'
+        }
+      }
+    );
+  } catch (err) {
+    console.error('Note creation error:', err.response?.data || err.message);
+  }
+}
+
+// ========================= WEBHOOK =========================
+app.get('/intercom-webhook', (_, res) => res.send('OK'));
+
+app.post('/intercom-webhook', async (req, res) => {
+  res.sendStatus(200);
+  if (!ENABLED) return;
+
+  try {
+    const { topic, data } = req.body;
+    if (!['conversation.user.replied', 'conversation.user.created'].includes(topic)) return;
+
+    const conv = data.item;
+    const convId = conv?.id;
+    if (!convId) return;
+
+    const text = extractTextFromWebhook(conv, topic);
+    if (!text || text.length < 5) return;
+
+    const wordCount = text.trim().split(/\s+/).filter(Boolean).length;
+    if (wordCount < MIN_WORDS_FOR_TRANSLATION) {
+      if (DEBUG) console.log(`[SKIP SHORT] ${wordCount} слов`);
+      return;
+    }
+
+    const textHash = crypto.createHash('md5').update(text).digest('hex').slice(0, 8);
+    const key = `${convId}:${textHash}`;
+    if (PROCESSED.has(key)) return;
+    PROCESSED.set(key, true);
+
+    const intercomLang = conv.language_override || conv.source?.language || 'auto';
+    if (DEBUG) console.log(`[REQ] ${wordCount} слов | Lang: ${intercomLang} | "${text.substring(0, 80)}..."`);
+
+    const translation = await translate(text, intercomLang);
+    if (!translation) return;
+
+    await createNote(convId, translation);
+    console.log(`[OK] Переведено [${translation.sourceLang}→en] — ${convId}`);
+  } catch (err) {
+    console.error('Webhook error:', err.message);
+  }
+});
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v8.7 запущен (DeepL → Lingva → Google GTX → Libre → MyMemory)`);
+  console.log(`Автопереводчик v8.7 запущен (DeepL → Lingva → Google GTX с backoff → Libre → MyMemory)`);
   console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
-  console.log(`→ Lingva: ${LINGVA_BASES.length} публичных инстансов`);
-  console.log(`→ Google GTX: unofficial (с паузой)`);
+  console.log(`→ Lingva: ${LINGVA_BASES.length} инстансов`);
+  console.log(`→ Google GTX: unofficial с экспоненциальным backoff (начало ${gtxBackoff} мс)`);
   console.log(`→ Libre: ${LIBRE_APIS.length} зеркал`);
   console.log(`→ MyMemory: ${MYMEMORY_KEY || MYMEMORY_EMAIL ? 'ВКЛ' : 'анонимно'}`);
   console.log(`→ Порт: ${PORT}`);
