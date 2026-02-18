@@ -5,7 +5,7 @@ import http from 'http';
 import dotenv from 'dotenv';
 import NodeCache from 'node-cache';
 import crypto from 'node:crypto';
-import { franc } from 'franc';   // ← добавь в зависимости, если ещё нет
+import { franc } from 'franc';  // npm i franc
 
 dotenv.config();
 
@@ -18,7 +18,9 @@ const ADMIN_ID = process.env.ADMIN_ID?.trim();
 const DEEPL_KEY = process.env.DEEPL_KEY?.trim();
 const MICROSOFT_KEY = process.env.MICROSOFT_KEY?.trim();
 const MICROSOFT_REGION = process.env.MICROSOFT_REGION?.trim() || 'westeurope';
-const MYMEMORY_KEY = process.env.MYMEMORY_KEY?.trim() || '';
+const MYMEMORY_KEY = process.env.MYMEMORY_KEY?.trim();       // платный ключ, если есть
+const MYMEMORY_EMAIL = process.env.MYMEMORY_EMAIL?.trim();   // для бесплатного лимита 50k/день
+
 const ENABLED = process.env.ENABLED === 'true';
 const DEBUG = process.env.DEBUG === 'true';
 const TARGET_LANG = 'en';
@@ -33,7 +35,7 @@ const PROCESSED = new NodeCache({ stdTTL: 300, checkperiod: 120 });
 const axiosInstance = axios.create({
   timeout: 15000,
   httpAgent: new http.Agent({ keepAlive: true }),
-  headers: { 'User-Agent': 'IntercomAutoTranslate/8.2' }
+  headers: { 'User-Agent': 'IntercomAutoTranslate/8.3' }
 });
 
 // ========================= УТИЛИТЫ =========================
@@ -58,18 +60,17 @@ function isGarbage(text = '') {
 function isProbablyEnglish(original, translated) {
   const o = original.toLowerCase().replace(/[^\w\s]/g, '');
   const t = translated.toLowerCase().replace(/[^\w\s]/g, '');
-  if (o.length === 0 || t.length === 0) return true;
+  if (o.length < 5 || t.length < 5) return false;
   const maxLen = Math.max(o.length, t.length);
-  let diffCount = 0;
+  let diffCount = Math.abs(o.length - t.length);
   for (let i = 0; i < Math.min(o.length, t.length); i++) {
     if (o[i] !== t[i]) diffCount++;
   }
-  diffCount += Math.abs(o.length - t.length);
   const similarity = 1 - diffCount / maxLen;
-  return similarity > 0.88; // чуть строже
+  return similarity > 0.88;
 }
 
-// ========================= ИЗВЛЕЧЕНИЕ ТЕКСТА =========================
+// ========================= ИЗВЛЕЧЕНИЕ + ОПРЕДЕЛЕНИЕ ЯЗЫКА =========================
 function extractTextFromWebhook(conv, topic) {
   let body = '';
   if (topic === 'conversation.user.created' && conv.source?.body) {
@@ -84,8 +85,7 @@ function extractTextFromWebhook(conv, topic) {
   return cleanText(body);
 }
 
-// ========================= ОПРЕДЕЛЕНИЕ ЯЗЫКА =========================
-function detectLanguage(text) {
+function detectLanguageFallback(text) {
   const code = franc(text, { minLength: 4 });
   return code === 'und' ? 'auto' : (code === 'eng' ? 'en' : code.slice(0, 2));
 }
@@ -95,7 +95,7 @@ async function translate(text, preferredLang = 'auto') {
   if (text.length > 5000) text = text.substring(0, 5000);
 
   let langCode = preferredLang.toLowerCase();
-  if (langCode === 'auto') langCode = detectLanguage(text);
+  if (langCode === 'auto') langCode = detectLanguageFallback(text);
 
   if (SKIP_LANGS.has(langCode)) {
     if (DEBUG) console.log(`[SKIP LANG] ${langCode}`);
@@ -112,12 +112,13 @@ async function translate(text, preferredLang = 'auto') {
 
   let result = null;
 
-  // 1. DeepL
+  // 1. DeepL (теперь с правильным заголовком — обязательно!)
   if (DEEPL_KEY) {
     if (DEBUG) console.log('[TRY DEEPL]');
     result = await tryDeepL(text);
     if (result) {
       if (isProbablyEnglish(text, result.text)) {
+        if (DEBUG) console.log('[SKIP ENGLISH] DeepL вернул почти оригинал');
         CACHE.set(cacheKey, 'english');
         return null;
       }
@@ -132,6 +133,7 @@ async function translate(text, preferredLang = 'auto') {
     result = await tryMicrosoft(text);
     if (result) {
       if (isProbablyEnglish(text, result.text)) {
+        if (DEBUG) console.log('[SKIP ENGLISH] Microsoft вернул почти оригинал');
         CACHE.set(cacheKey, 'english');
         return null;
       }
@@ -145,6 +147,7 @@ async function translate(text, preferredLang = 'auto') {
   result = await tryMyMemory(text);
   if (result) {
     if (isProbablyEnglish(text, result.text)) {
+      if (DEBUG) console.log('[SKIP ENGLISH] MyMemory вернул почти оригинал');
       CACHE.set(cacheKey, 'english');
       return null;
     }
@@ -156,79 +159,88 @@ async function translate(text, preferredLang = 'auto') {
 }
 
 async function tryDeepL(text) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await axiosInstance.post('https://api-free.deepl.com/v2/translate', {
-        text: [text],  // теперь в body как массив
-        target_lang: 'EN',
-        preserve_formatting: true
-      }, {
-        headers: {
-          'Authorization': `DeepL-Auth-Key ${DEEPL_KEY}`,
-          'Content-Type': 'application/json'
-        }
-      });
-      const tr = res.data?.translations?.[0];
-      const translated = tr?.text?.trim();
-      if (translated && translated.length > 3 && !isGarbage(translated)) {
-        if (DEBUG) console.log(`[DEEPL OK] ${tr?.detected_source_language?.toLowerCase() || 'auto'} → en`);
-        return { text: translated, sourceLang: tr?.detected_source_language?.toLowerCase() || 'auto' };
+  try {
+    const res = await axiosInstance.post('https://api-free.deepl.com/v2/translate', {
+      text: [text],
+      target_lang: 'EN',
+      preserve_formatting: true
+    }, {
+      headers: {
+        'Authorization': `DeepL-Auth-Key ${DEEPL_KEY}`,
+        'Content-Type': 'application/json'
       }
-    } catch (err) {
-      const status = err.response?.status;
-      if (DEBUG) console.log(`[DEEPL ERR] attempt ${attempt}: ${err.message} (${status})`);
-      if (status === 456) return null; // квота
-      if (status === 429) await new Promise(r => setTimeout(r, 2000 * attempt));
+    });
+
+    const tr = res.data?.translations?.[0];
+    const translated = tr?.text?.trim();
+    if (translated && translated.length > 3 && !isGarbage(translated)) {
+      const src = tr?.detected_source_language?.toLowerCase() || 'auto';
+      if (DEBUG) console.log(`[DEEPL OK] ${src} → en`);
+      return { text: translated, sourceLang: src };
     }
+  } catch (err) {
+    const status = err.response?.status;
+    if (DEBUG) console.log(`[DEEPL ERR] ${err.message} (${status || 'нет'})`);
+    if (status === 456) console.log('[DEEPL] Квота исчерпана — месяц подождать');
   }
   return null;
 }
 
 async function tryMicrosoft(text) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const res = await axiosInstance.post(
-        `https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en`,
-        [{ Text: text }],
-        {
-          headers: {
-            'Ocp-Apim-Subscription-Key': MICROSOFT_KEY,
-            'Ocp-Apim-Subscription-Region': MICROSOFT_REGION,
-            'Content-Type': 'application/json'
-          }
+  try {
+    const res = await axiosInstance.post(
+      `https://api.cognitive.microsofttranslator.com/translate?api-version=3.0&to=en`,
+      [{ Text: text }],
+      {
+        headers: {
+          'Ocp-Apim-Subscription-Key': MICROSOFT_KEY,
+          'Ocp-Apim-Subscription-Region': MICROSOFT_REGION,
+          'Content-Type': 'application/json'
         }
-      );
-      const tr = res.data[0]?.translations[0];
-      const translated = tr?.text?.trim();
-      if (translated && translated.length > 3 && !isGarbage(translated)) {
-        return {
-          text: translated,
-          sourceLang: res.data[0]?.detectedLanguage?.language?.toLowerCase() || 'auto'
-        };
       }
-    } catch (err) {
-      const status = err.response?.status;
-      if (DEBUG) console.log(`[MS ERR] attempt ${attempt}: ${err.message} (${status})`);
-      if (status === 429) await new Promise(r => setTimeout(r, 2000 * attempt));
+    );
+
+    const tr = res.data?.[0]?.translations?.[0];
+    const translated = tr?.text?.trim();
+    if (translated && translated.length > 3 && !isGarbage(translated)) {
+      const src = res.data[0]?.detectedLanguage?.language?.toLowerCase() || 'auto';
+      if (DEBUG) console.log(`[MICROSOFT OK] ${src} → en`);
+      return { text: translated, sourceLang: src };
     }
+  } catch (err) {
+    const status = err.response?.status;
+    if (DEBUG) console.log(`[MICROSOFT ERR] ${err.message} (${status || 'нет'})`);
+    if (status === 401) console.log('[MICROSOFT] 401 — проверь ключ и регион в Azure Portal');
+    if (status === 429) console.log('[MICROSOFT] 429 — rate limit, подожди 5–10 мин');
   }
   return null;
 }
 
 async function tryMyMemory(text) {
-  for (let attempt = 1; attempt <= 2; attempt++) {
-    try {
-      const params = { q: text, langpair: 'auto|en' };
-      if (MYMEMORY_KEY) params.key = MYMEMORY_KEY;
+  try {
+    const params = { q: text, langpair: 'auto|en' };
 
-      const res = await axiosInstance.get('https://api.mymemory.translated.net/get', { params });
-      const translated = res.data.responseData?.translatedText?.trim();
-      if (translated && translated.length > 3 && !isGarbage(translated)) {
-        return { text: translated, sourceLang: 'auto' };
-      }
-    } catch (err) {
-      if (DEBUG) console.log(`[MYMEMORY ERR] attempt ${attempt}: ${err.message}`);
+    if (MYMEMORY_KEY) {
+      params.key = MYMEMORY_KEY;
+      if (DEBUG) console.log('[MYMEMORY] Используем платный key');
+    } else if (MYMEMORY_EMAIL) {
+      params.de = MYMEMORY_EMAIL;
+      if (DEBUG) console.log('[MYMEMORY] Используем email для повышенного лимита');
+    } else {
+      if (DEBUG) console.log('[MYMEMORY] Анонимный режим — лимит очень низкий');
     }
+
+    const res = await axiosInstance.get('https://api.mymemory.translated.net/get', { params });
+
+    const translated = res.data?.responseData?.translatedText?.trim();
+    if (translated && translated.length > 3 && !isGarbage(translated)) {
+      if (DEBUG) console.log('[MYMEMORY OK]');
+      return { text: translated, sourceLang: 'auto' };
+    }
+  } catch (err) {
+    const status = err.response?.status;
+    if (DEBUG) console.log(`[MYMEMORY ERR] ${err.message} (${status || 'нет'})`);
+    if (status === 429) console.log('[MYMEMORY] 429 — дневной лимит исчерпан, новая почта или подожди до завтра');
   }
   return null;
 }
@@ -300,9 +312,9 @@ app.post('/intercom-webhook', async (req, res) => {
 
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => {
-  console.log(`Автопереводчик v8.2 запущен`);
-  console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
+  console.log(`Автопереводчик v8.3 запущен`);
+  console.log(`→ DeepL: ${DEEPL_KEY ? 'ВКЛ (новый auth)' : 'ВЫКЛ'}`);
   console.log(`→ Microsoft (${MICROSOFT_REGION}): ${MICROSOFT_KEY ? 'ВКЛ' : 'ВЫКЛ'}`);
-  console.log(`→ MyMemory: ${MYMEMORY_KEY ? 'с ключом' : 'анонимно'}`);
+  console.log(`→ MyMemory: ${MYMEMORY_KEY ? 'с ключом' : MYMEMORY_EMAIL ? 'с email' : 'анонимно'}`);
   console.log(`→ Порт: ${PORT}`);
 });
